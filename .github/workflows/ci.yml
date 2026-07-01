@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # Use bash on all runners (Git Bash on Windows) so the steps are identical.
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # `--all-features` enables `bundled-sqlite`, so libsqlite3-sys compiles its
+      # vendored SQLite — no system-sqlite dependency on Linux/Windows. This also
+      # compiles the platform-dependent paths (the `%.16g` export formatting and
+      # the sqlite3_vtab_nochange / sqlite3_vtab_rhs_value FFI externs).
+      - name: Format
+        run: cargo fmt --check --all
+
+      - name: Clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - name: Docs
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Build
+        run: cargo build --all-features
+
+      - name: Build examples
+        run: cargo build --examples --all-features

@@ -1,0 +1,29 @@
+[package]
+name = "libxsql"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Elias Bachaalany"]
+license = "MPL-2.0"
+description = "Safe, typed Rust builders for SQLite virtual tables (index, cached, and generator), scalar/aggregate functions, scripts/export, and an optional HTTP thinclient."
+repository = "https://github.com/0xeb/libxsql-rs"
+documentation = "https://docs.rs/libxsql"
+readme = "README.md"
+keywords = ["sqlite", "virtual-table", "vtab", "ffi", "database"]
+categories = ["database", "api-bindings", "external-ffi-bindings"]
+
+[features]
+default = []
+bundled-sqlite = ["libsqlite3-sys/bundled"]
+thinclient = ["dep:serde_json", "dep:tiny_http", "dep:ureq"]
+serde = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+libsqlite3-sys = "0.30"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", features = ["preserve_order"], optional = true }
+thiserror = "2"
+# Thinclient HTTP transport (blocking, no TLS; loopback by default, auth
+# required for non-loopback unless explicitly overridden).
+tiny_http = { version = "0.12", optional = true }
+ureq = { version = "3", optional = true, default-features = false }
