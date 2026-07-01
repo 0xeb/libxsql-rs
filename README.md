@@ -1,6 +1,6 @@
 # libxsql-rs
 
-`libxsql-rs` is a Rust port of libxsql for exposing Rust data through SQLite.
+`libxsql-rs` is a Rust port of [libxsql](https://github.com/0xeb/libxsql) for exposing Rust data through SQLite.
 It provides safe, typed builders for SQLite virtual tables while keeping direct
 access to the SQLite planner, update callbacks, scalar functions, aggregate
 functions, and query execution APIs that higher-level wrappers usually hide.
