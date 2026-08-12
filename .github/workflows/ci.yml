@@ -54,3 +54,6 @@ jobs:
 
       - name: Build examples
         run: cargo build --examples --all-features
+
+      - name: Test
+        run: cargo test --all-features

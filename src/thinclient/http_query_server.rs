@@ -1,8 +1,8 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 use crate::{
     Error, Result, ScriptOptions, ScriptResult, json_to_script_result, run_script_with_executor,
@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, TcpListener};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -37,9 +37,10 @@ pub struct HttpQueryServerConfig {
     pub help_text: String,
     /// Address to bind the listener to (default `127.0.0.1`).
     pub bind_address: String,
-    /// Port to bind; `0` picks a random free port in `[8100, 8199]`.
+    /// Port to bind; `0` picks a random free port in `[8100, 8999]`.
     pub port: u16,
-    /// Optional auth token required on `/query`, `/status`, and `/shutdown`.
+    /// Optional auth token required on `/query`, `/cancel`, `/shutdown`, and by
+    /// default `/status`.
     pub auth_token: Option<String>,
     /// Allow binding a non-loopback address without an auth token. Default
     /// `false`: [`HttpQueryServer::start`] refuses to bind a public address
@@ -50,6 +51,9 @@ pub struct HttpQueryServerConfig {
     pub status_fields: BTreeMap<String, String>,
     /// Optional callback whose JSON is merge-patched onto the `/status` body.
     pub status_fn: Option<Arc<StatusFn>>,
+    /// Require [`Self::auth_token`] on `/status`. Defaults to `true`; set this
+    /// explicitly to `false` only for an intentionally public liveness probe.
+    pub status_requires_auth: bool,
     /// Additional non-standard routes appended after the built-in routes.
     pub extra_routes: Vec<ExtraRoute>,
     /// When `true`, queries are enqueued for an owner thread instead of run on
@@ -57,7 +61,8 @@ pub struct HttpQueryServerConfig {
     pub queue_mode: bool,
     /// How long a queued request waits for admission before timing out.
     pub queue_admission_timeout: Duration,
-    /// Maximum pending queued commands; `0` means unbounded.
+    /// Maximum admitted commands (waiting plus currently processing); `0` means
+    /// unbounded.
     pub max_queue: usize,
     /// Optional dynamic override for [`Self::queue_admission_timeout`].
     pub queue_admission_timeout_fn: Option<Arc<DurationFn>>,
@@ -76,7 +81,9 @@ pub struct HttpQueryServerConfig {
     /// Whole-script executor: the server parses options/format and hands the
     /// entire script to this callback (for batch/atomic semantics where a later
     /// statement must not read stale data after an earlier mutation). The
-    /// returned [`ScriptResult`] is formatted by the server.
+    /// returned [`ScriptResult`] is formatted by the server. This is the only
+    /// executor shape that receives request cancellation through
+    /// [`ScriptOptions::should_cancel`].
     /// Takes precedence over [`Self::statement_executor`] and the `query_fn`.
     pub script_executor: Option<Arc<ScriptExecutorFn>>,
     /// When `true` (and [`Self::queue_mode`] is `false`), serialize `/query`
@@ -85,6 +92,11 @@ pub struct HttpQueryServerConfig {
     /// that are not concurrency-safe yet run on the HTTP worker rather than a
     /// main-thread queue. Ignored when `queue_mode` is `true`.
     pub serialize_requests: bool,
+    /// Maximum accepted request-body size in bytes; a request whose
+    /// `Content-Length` exceeds this is rejected with `413 Payload Too Large`
+    /// before the body is read. `0` disables the limit. Defaults to 64 MiB,
+    /// matching the C++ `http_query_server_config::max_request_body_bytes`.
+    pub max_request_body_bytes: usize,
 }
 
 impl Default for HttpQueryServerConfig {
@@ -94,12 +106,13 @@ impl Default for HttpQueryServerConfig {
             help_text: "xsql HTTP query server".to_string(),
             bind_address: "127.0.0.1".to_string(),
             // 0 matches the C++ http_query_server_config default: pick a random
-            // port from [8100, 8199].
+            // port from [8100, 8999].
             port: 0,
             auth_token: None,
             allow_insecure_no_auth: false,
             status_fields: BTreeMap::new(),
             status_fn: None,
+            status_requires_auth: true,
             extra_routes: Vec::new(),
             queue_mode: false,
             queue_admission_timeout: Duration::from_secs(60),
@@ -110,6 +123,7 @@ impl Default for HttpQueryServerConfig {
             statement_executor: None,
             script_executor: None,
             serialize_requests: false,
+            max_request_body_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -152,6 +166,7 @@ pub struct HttpQueryServer {
     config: HttpQueryServerConfig,
     query: Arc<QueryFn>,
     shutdown: Arc<AtomicBool>,
+    cancel_epoch: Arc<AtomicU64>,
 }
 
 impl HttpQueryServer {
@@ -165,6 +180,7 @@ impl HttpQueryServer {
             config,
             query: Arc::new(query),
             shutdown: Arc::new(AtomicBool::new(false)),
+            cancel_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -197,6 +213,8 @@ impl HttpQueryServer {
         let config = self.config.clone();
         let shutdown = self.shutdown.clone();
         let thread_shutdown = shutdown.clone();
+        let cancel_epoch = self.cancel_epoch.clone();
+        let thread_cancel_epoch = cancel_epoch.clone();
         let queue = self
             .config
             .queue_mode
@@ -213,7 +231,14 @@ impl HttpQueryServer {
         };
         let thread_http = http.clone();
         let join = thread::spawn(move || {
-            serve_loop(thread_http, local_addr, config, executor, thread_shutdown);
+            serve_loop(
+                thread_http,
+                local_addr,
+                config,
+                executor,
+                thread_shutdown,
+                thread_cancel_epoch,
+            );
         });
         let interrupt_check = Arc::new(Mutex::new(self.config.interrupt_check.clone()));
         Ok(HttpQueryServerHandle {
@@ -225,6 +250,7 @@ impl HttpQueryServer {
             statement_executor: self.config.statement_executor.clone(),
             queue,
             interrupt_check,
+            cancel_epoch,
             join: Some(join),
         })
     }
@@ -254,6 +280,7 @@ pub struct HttpQueryServerHandle {
     statement_executor: Option<Arc<StatementExecutorFn>>,
     queue: Option<Arc<CommandQueue>>,
     interrupt_check: Arc<Mutex<Option<Arc<InterruptFn>>>>,
+    cancel_epoch: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -288,7 +315,7 @@ impl HttpQueryServerHandle {
         self.shutdown.store(true, Ordering::SeqCst);
         self.http.unblock();
         if let Some(queue) = &self.queue {
-            queue.drain_pending(Err(Error::Message("HTTP server stopped".to_string())));
+            queue.drain_pending();
         }
     }
 
@@ -311,6 +338,7 @@ impl HttpQueryServerHandle {
             &self.query,
             timeout,
             &self.shutdown,
+            &self.cancel_epoch,
         )
     }
 
@@ -346,6 +374,19 @@ impl HttpQueryServerHandle {
             .lock()
             .expect("interrupt check lock poisoned");
         *slot = None;
+    }
+
+    /// Cooperatively cancel requests that were admitted before this call.
+    ///
+    /// This is effective only when a script executor is configured; statement
+    /// executors and the legacy string callback have no in-flight cancellation
+    /// seam.
+    pub fn cancel(&self) -> bool {
+        if self.script_executor.is_none() {
+            return false;
+        }
+        self.cancel_epoch.fetch_add(1, Ordering::SeqCst);
+        true
     }
 
     /// Join the server thread, returning an error if it panicked. Idempotent.
@@ -421,7 +462,7 @@ impl SerializeGate {
         max_queue: usize,
     ) -> std::result::Result<SerializeGuard<'_>, Admit> {
         let mut state = self.state.lock().expect("serialize gate poisoned");
-        if max_queue > 0 && state.waiting >= max_queue {
+        if max_queue > 0 && state.waiting + usize::from(state.busy) >= max_queue {
             return Err(Admit::QueueFull);
         }
         state.waiting += 1;
@@ -455,21 +496,41 @@ impl SerializeGate {
 
 #[derive(Default)]
 struct CommandQueue {
-    pending: Mutex<VecDeque<Arc<QueuedCommand>>>,
+    state: Mutex<CommandQueueState>,
     available: Condvar,
+}
+
+#[derive(Default)]
+struct CommandQueueState {
+    pending: VecDeque<Arc<QueuedCommand>>,
+    /// Queued plus currently processing commands.
+    admitted: usize,
 }
 
 struct QueuedCommand {
     sql: String,
     opts: ScriptOptions,
     format: String,
-    result: Mutex<Option<Result<String>>>,
+    state: Mutex<QueuedCommandState>,
     done: Condvar,
+    /// The `/cancel` epoch snapshot for this request, armed to the current epoch
+    /// at execution start (not at receipt). `opts.should_cancel` compares the live
+    /// epoch against this cell, so a `/cancel` that arrives while the command is
+    /// still queued does not abort it — only an actually-running query. Mirrors the
+    /// C++ `cancel_epoch_cell`.
+    cancel_cell: Arc<AtomicU64>,
+}
+
+enum QueuedCommandState {
+    Queued,
+    Started,
+    Finished(QueryHttpResponse),
+    Cancelled,
 }
 
 impl CommandQueue {
-    /// Enqueue a request for the owner thread, which renders it (statement
-    /// executor or query callback) per `opts`/`format`, and wait for the body.
+    /// Enqueue a request and wait only for admission. Once the owner thread
+    /// marks it started, the admission deadline no longer applies.
     fn enqueue_and_wait(
         &self,
         sql: &str,
@@ -477,16 +538,23 @@ impl CommandQueue {
         format: &str,
         config: &HttpQueryServerConfig,
         shutdown: &AtomicBool,
-    ) -> String {
+        cancel_cell: Arc<AtomicU64>,
+    ) -> QueryHttpResponse {
+        let json_response = |status, body| QueryHttpResponse {
+            status,
+            content_type: "application/json".to_string(),
+            body,
+        };
         if shutdown.load(Ordering::SeqCst) {
-            return json_error("Server not running");
+            return json_response(503, json_error("HTTP server stopped"));
         }
         let command = Arc::new(QueuedCommand {
             sql: sql.to_string(),
-            opts: *opts,
+            opts: opts.clone(),
             format: format.to_string(),
-            result: Mutex::new(None),
+            state: Mutex::new(QueuedCommandState::Queued),
             done: Condvar::new(),
+            cancel_cell,
         });
         let wait_timeout = config
             .queue_admission_timeout_fn
@@ -499,65 +567,112 @@ impl CommandQueue {
             .map(|max_queue| max_queue())
             .unwrap_or(config.max_queue);
         {
-            let mut pending = self.pending.lock().expect("queue lock poisoned");
-            if max_queue > 0 && pending.len() >= max_queue {
-                return json_error_with_hint(
-                    "Queue full",
-                    "Reduce concurrency or increase max_queue",
+            let mut state = self.state.lock().expect("queue lock poisoned");
+            if shutdown.load(Ordering::SeqCst) {
+                return json_response(503, json_error("HTTP server stopped"));
+            }
+            if max_queue > 0 && state.admitted >= max_queue {
+                return json_response(
+                    503,
+                    json_error_with_hint("Queue full", "Reduce concurrency or increase max_queue"),
                 );
             }
-            pending.push_back(command.clone());
+            state.admitted += 1;
+            state.pending.push_back(command.clone());
         }
         self.available.notify_one();
 
-        let started = Instant::now();
-        let mut result = command.result.lock().expect("command lock poisoned");
+        let deadline = (!wait_timeout.is_zero()).then(|| Instant::now() + wait_timeout);
         loop {
-            if let Some(result) = result.take() {
-                return match result {
-                    Ok(body) => body,
-                    Err(err) => json_error(err.to_string()),
-                };
-            }
-            if wait_timeout.is_zero() {
-                result = command.done.wait(result).expect("command wait poisoned");
-                continue;
-            }
-            let Some(remaining) = wait_timeout.checked_sub(started.elapsed()) else {
-                return json_error_with_hint(
-                    "Request timed out while waiting in queue",
-                    "Reduce concurrency or increase queue_admission_timeout_ms",
-                );
-            };
-            let (guard, wait) = command
-                .done
-                .wait_timeout(result, remaining)
-                .expect("command wait poisoned");
-            result = guard;
-            if wait.timed_out() && result.is_none() {
-                return json_error_with_hint(
-                    "Request timed out while waiting in queue",
-                    "Reduce concurrency or increase queue_admission_timeout_ms",
-                );
+            let mut state = command.state.lock().expect("command lock poisoned");
+            match &*state {
+                QueuedCommandState::Finished(_) => {
+                    let QueuedCommandState::Finished(response) =
+                        std::mem::replace(&mut *state, QueuedCommandState::Cancelled)
+                    else {
+                        unreachable!()
+                    };
+                    return response;
+                }
+                QueuedCommandState::Started => {
+                    state = command.done.wait(state).expect("command wait poisoned");
+                    drop(state);
+                }
+                QueuedCommandState::Queued => {
+                    let Some(deadline) = deadline else {
+                        state = command.done.wait(state).expect("command wait poisoned");
+                        drop(state);
+                        continue;
+                    };
+                    let now = Instant::now();
+                    if now >= deadline {
+                        drop(state);
+                        if self.cancel_queued(&command) {
+                            return json_response(
+                                408,
+                                json_error_with_hint(
+                                    "Request timed out while waiting in queue",
+                                    "Reduce concurrency or increase queue_admission_timeout_ms",
+                                ),
+                            );
+                        }
+                        continue;
+                    }
+                    let (guard, _) = command
+                        .done
+                        .wait_timeout(state, deadline - now)
+                        .expect("command wait poisoned");
+                    drop(guard);
+                }
+                QueuedCommandState::Cancelled => {
+                    return json_response(503, json_error("HTTP server stopped"));
+                }
             }
         }
     }
 
-    fn drain_pending(&self, result: Result<String>) {
-        let mut pending = self.pending.lock().expect("queue lock poisoned");
-        let commands = pending.drain(..).collect::<Vec<_>>();
-        drop(pending);
-        let mut result = Some(result);
+    fn cancel_queued(&self, command: &Arc<QueuedCommand>) -> bool {
+        let mut queue = self.state.lock().expect("queue lock poisoned");
+        let Some(position) = queue
+            .pending
+            .iter()
+            .position(|pending| Arc::ptr_eq(pending, command))
+        else {
+            return false;
+        };
+        queue.pending.remove(position);
+        queue.admitted = queue.admitted.saturating_sub(1);
+        let mut state = command.state.lock().expect("command lock poisoned");
+        *state = QueuedCommandState::Cancelled;
+        command.done.notify_all();
+        true
+    }
+
+    fn finish(&self, command: &QueuedCommand, response: QueryHttpResponse) {
+        {
+            let mut queue = self.state.lock().expect("queue lock poisoned");
+            queue.admitted = queue.admitted.saturating_sub(1);
+        }
+        let mut state = command.state.lock().expect("command lock poisoned");
+        *state = QueuedCommandState::Finished(response);
+        command.done.notify_all();
+    }
+
+    fn drain_pending(&self) {
+        let commands = {
+            let mut queue = self.state.lock().expect("queue lock poisoned");
+            let commands = queue.pending.drain(..).collect::<Vec<_>>();
+            queue.admitted = queue.admitted.saturating_sub(commands.len());
+            commands
+        };
         for command in commands {
-            let mut slot = command.result.lock().expect("command lock poisoned");
-            if slot.is_none() {
-                *slot = Some(
-                    result
-                        .take()
-                        .unwrap_or_else(|| Err(Error::Message("HTTP server stopped".to_string()))),
-                );
-            }
-            command.done.notify_one();
+            let mut state = command.state.lock().expect("command lock poisoned");
+            *state = QueuedCommandState::Finished(QueryHttpResponse {
+                status: 503,
+                content_type: "application/json".to_string(),
+                body: json_error("HTTP server stopped"),
+            });
+            command.done.notify_all();
         }
     }
 }
@@ -575,6 +690,7 @@ fn serve_loop(
     config: HttpQueryServerConfig,
     executor: QueryExecutor,
     shutdown: Arc<AtomicBool>,
+    cancel_epoch: Arc<AtomicU64>,
 ) {
     // tiny_http parks the accept thread until a request arrives; shutdown() calls
     // http.unblock(), which ends incoming_requests() and exits this loop.
@@ -585,9 +701,18 @@ fn serve_loop(
         let config = config.clone();
         let executor = executor.clone();
         let shutdown = shutdown.clone();
+        let cancel_epoch = cancel_epoch.clone();
         let http = http.clone();
         thread::spawn(move || {
-            let _ = handle_connection(request, local_addr, &config, executor, shutdown, &http);
+            let _ = handle_connection(
+                request,
+                local_addr,
+                &config,
+                executor,
+                shutdown,
+                cancel_epoch,
+                &http,
+            );
         });
     }
     shutdown.store(true, Ordering::SeqCst);
@@ -599,8 +724,23 @@ fn handle_connection(
     config: &HttpQueryServerConfig,
     executor: QueryExecutor,
     shutdown: Arc<AtomicBool>,
+    cancel_epoch: Arc<AtomicU64>,
     http: &Arc<TinyServer>,
 ) -> Result<()> {
+    // Reject an oversized body before reading it into memory, mirroring the C++
+    // `set_payload_max_length` 413 (transport-level, ahead of auth).
+    if config.max_request_body_bytes > 0
+        && request
+            .body_length()
+            .is_some_and(|len| len > config.max_request_body_bytes)
+    {
+        return respond(
+            request,
+            413,
+            "application/json",
+            &json_error("request body exceeds maximum allowed size"),
+        );
+    }
     let req = to_http_request(&mut request);
     if !auth_ok(config, &req) {
         return respond(
@@ -619,7 +759,7 @@ fn handle_connection(
         ),
         ("GET", "/help") => respond(request, 200, "text/plain", &config.help_text),
         ("POST", "/query") => {
-            let response = handle_query(config, &executor, &shutdown, &req);
+            let response = handle_query(config, &executor, &shutdown, &cancel_epoch, &req);
             respond(
                 request,
                 response.status,
@@ -636,11 +776,28 @@ fn handle_connection(
                 &json_error(err.to_string()),
             ),
         },
+        ("POST", "/cancel") => {
+            if config.script_executor.is_none() {
+                return respond(
+                    request,
+                    409,
+                    "application/json",
+                    &json_error("cancellation is not supported by the configured query callback"),
+                );
+            }
+            cancel_epoch.fetch_add(1, Ordering::SeqCst);
+            respond(
+                request,
+                200,
+                "application/json",
+                &json!({"success": true, "message": "cancel requested"}).to_string(),
+            )
+        }
         ("POST", "/shutdown") => {
             shutdown.store(true, Ordering::SeqCst);
             http.unblock();
             if let QueryExecutor::Queue(queue) = &executor {
-                queue.drain_pending(Err(Error::Message("HTTP server stopped".to_string())));
+                queue.drain_pending();
             }
             respond(
                 request,
@@ -740,8 +897,9 @@ fn content_type_for(format: &str) -> &'static str {
 }
 
 /// Execute one resolved request by executor precedence:
-/// `script_executor` > `statement_executor` > `query_fn`. The first two own
-/// orchestration and format directly from a [`ScriptResult`]; the callback path
+/// `script_executor` > `statement_executor` > `query_fn`. Only the script
+/// executor has an in-flight cancellation seam. Both executor forms format
+/// directly from a [`ScriptResult`]; the callback path
 /// returns a JSON string, re-parsed only for non-json output formats.
 fn render_query(
     script_executor: Option<&Arc<ScriptExecutorFn>>,
@@ -757,7 +915,7 @@ fn render_query(
         format_script_result(&result, format, opts.include_sql)
     } else if let Some(statement_executor) = statement_executor {
         let statement_executor = statement_executor.clone();
-        let opts_owned = *opts;
+        let opts_owned = opts.clone();
         let result = catch_unwind(AssertUnwindSafe(|| {
             run_script_with_executor(sql, opts_owned, |stmt, out| statement_executor(stmt, out))
         }))
@@ -824,6 +982,7 @@ fn handle_query(
     config: &HttpQueryServerConfig,
     executor: &QueryExecutor,
     shutdown: &AtomicBool,
+    cancel_epoch: &Arc<AtomicU64>,
     request: &HttpRequest,
 ) -> QueryHttpResponse {
     let json_response = |status: u16, body: String| QueryHttpResponse {
@@ -831,6 +990,9 @@ fn handle_query(
         content_type: "application/json".to_string(),
         body,
     };
+    if shutdown.load(Ordering::SeqCst) {
+        return json_response(503, json_error("HTTP server stopped"));
+    }
 
     let format = request
         .param("format")
@@ -839,6 +1001,16 @@ fn handle_query(
         .to_string();
 
     let mut opts = ScriptOptions::default();
+    // The /cancel epoch snapshot lives in a shared cell armed at EXECUTION start
+    // (the direct arm below / the queue worker at dequeue), NOT at receipt — so a
+    // /cancel that arrives while a queued request is still waiting does not abort
+    // it, only an actually-running query. Mirrors the C++ cancel_epoch_cell.
+    let cancel_cell = Arc::new(AtomicU64::new(cancel_epoch.load(Ordering::SeqCst)));
+    let should_cancel_epoch = cancel_epoch.clone();
+    let should_cancel_cell = cancel_cell.clone();
+    opts.should_cancel = Some(Arc::new(move || {
+        should_cancel_epoch.load(Ordering::SeqCst) != should_cancel_cell.load(Ordering::SeqCst)
+    }));
     let sql_text = match resolve_query_sql(request, &mut opts) {
         Ok(sql) => sql,
         Err(body) => return json_response(400, body),
@@ -854,11 +1026,9 @@ fn handle_query(
     }
 
     match executor {
-        QueryExecutor::Queue(queue) => QueryHttpResponse {
-            status: 200,
-            content_type: content_type_for(&format).to_string(),
-            body: queue.enqueue_and_wait(&sql_text, &opts, &format, config, shutdown),
-        },
+        QueryExecutor::Queue(queue) => {
+            queue.enqueue_and_wait(&sql_text, &opts, &format, config, shutdown, cancel_cell)
+        }
         QueryExecutor::Direct { query, gate } => {
             let _guard = match gate {
                 Some(gate) => {
@@ -896,6 +1066,9 @@ fn handle_query(
                 }
                 None => None,
             };
+            // Arm the /cancel snapshot at execution start (a /cancel that landed
+            // while waiting on the serialize gate must not abort this request).
+            cancel_cell.store(cancel_epoch.load(Ordering::SeqCst), Ordering::SeqCst);
             match render_query(
                 config.script_executor.as_ref(),
                 config.statement_executor.as_ref(),
@@ -922,35 +1095,56 @@ fn process_queued_command(
     query: &Arc<QueryFn>,
     timeout: Duration,
     shutdown: &AtomicBool,
+    cancel_epoch: &Arc<AtomicU64>,
 ) -> bool {
     let command = {
-        let mut pending = queue.pending.lock().expect("queue lock poisoned");
-        if pending.is_empty() && !timeout.is_zero() {
+        let mut state = queue.state.lock().expect("queue lock poisoned");
+        if state.pending.is_empty() && !timeout.is_zero() {
             let (guard, _) = queue
                 .available
-                .wait_timeout_while(pending, timeout, |pending| {
-                    pending.is_empty() && !shutdown.load(Ordering::SeqCst)
+                .wait_timeout_while(state, timeout, |state| {
+                    state.pending.is_empty() && !shutdown.load(Ordering::SeqCst)
                 })
                 .expect("queue wait poisoned");
-            pending = guard;
+            state = guard;
         }
-        pending.pop_front()
+        let command = state.pending.pop_front();
+        if let Some(command) = command.as_ref() {
+            let mut command_state = command.state.lock().expect("command lock poisoned");
+            // Execution starts now: arm the /cancel epoch snapshot so only a
+            // /cancel that arrives from here on aborts this request.
+            command
+                .cancel_cell
+                .store(cancel_epoch.load(Ordering::SeqCst), Ordering::SeqCst);
+            *command_state = QueuedCommandState::Started;
+            command.done.notify_all();
+        }
+        command
     };
 
     let Some(command) = command else {
         return false;
     };
-    let outcome = render_query(
+    let response = match render_query(
         script_executor,
         statement_executor,
         query,
         &command.sql,
         &command.opts,
         &command.format,
-    );
-    let mut slot = command.result.lock().expect("command lock poisoned");
-    *slot = Some(outcome);
-    command.done.notify_one();
+    ) {
+        Ok(body) => QueryHttpResponse {
+            status: 200,
+            content_type: content_type_for(&command.format).to_string(),
+            body,
+        },
+        Err(error) => QueryHttpResponse {
+            status: 500,
+            content_type: "application/json".to_string(),
+            body: json_error(error.to_string()),
+        },
+    };
+    queue.finish(&command, response);
     true
 }
 
@@ -967,16 +1161,20 @@ fn auth_ok(config: &HttpQueryServerConfig, request: &HttpRequest) -> bool {
     let Some(token) = &config.auth_token else {
         return true;
     };
-    if request.method == "GET" && (request.path == "/" || request.path == "/help") {
+    if request.method == "GET"
+        && (request.path == "/"
+            || request.path == "/help"
+            || (request.path == "/status" && !config.status_requires_auth))
+    {
         return true;
     }
     request
         .header("x-xsql-token")
-        .map(|value| value == *token)
+        .map(|value| super::timing_safe_equal(&value, token))
         .unwrap_or(false)
         || request
             .header("authorization")
-            .map(|value| value == format!("Bearer {token}"))
+            .map(|value| super::timing_safe_equal(&value, &format!("Bearer {token}")))
             .unwrap_or(false)
 }
 
@@ -989,6 +1187,7 @@ fn root_welcome(tool: &str, port: u16) -> String {
          \x20 GET  /help     - API documentation\n\
          \x20 POST /query    - Execute SQL query\n\
          \x20 GET  /status   - Health check\n\
+         \x20 POST /cancel   - Cancel the in-flight query\n\
          \x20 POST /shutdown - Stop server\n\n\
          Example: curl -X POST http://localhost:{port}/query -d \
          \"SELECT name FROM sqlite_master WHERE type='table' LIMIT 10\"\n"

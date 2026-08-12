@@ -1,10 +1,18 @@
+#
+# Copyright (c) 2024-2026 Elias Bachaalany
+# SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
+#
+# This file is licensed under the Human-Origin Source License v1.0.
+# See LICENSE.
+#
+
 [package]
 name = "libxsql"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Elias Bachaalany"]
-license = "MPL-2.0"
+license-file = "LICENSE"
 description = "Safe, typed Rust builders for SQLite virtual tables (index, cached, and generator), scalar/aggregate functions, scripts/export, and an optional HTTP thinclient."
 repository = "https://github.com/0xeb/libxsql-rs"
 documentation = "https://docs.rs/libxsql"

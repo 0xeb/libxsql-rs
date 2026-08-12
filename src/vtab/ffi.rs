@@ -1,8 +1,8 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 use crate::error::Result;
 use libsqlite3_sys as ffi;
@@ -136,6 +136,51 @@ pub(crate) unsafe fn set_vtab_error(p_vtab: *mut ffi::sqlite3_vtab, message: &st
         }
         set_error_message(&mut (*p_vtab).zErrMsg, message);
     }
+}
+
+// --- Capability-scoped errors for unsupported write surfaces -----------------
+//
+// A write to a surface/column that has no mutation support must NOT surface as
+// SQLite's generic "attempt to write a readonly database" -- that implies the
+// whole database is read-only when in fact it is writable and only THIS surface
+// is not. Compose an actionable message naming the surface and the missing
+// capability (`mutation.<table>.<leaf>`, the convention every tool uses in its
+// `capabilities` table) and return `SQLITE_ERROR` (not `SQLITE_READONLY`) with
+// the message set on the vtab. This is the matched-row half of the fix; the
+// prepare-time authorizer (see [`super::write_surface`]) produces the identical
+// message for the 0-row case so both report consistently.
+//
+// The composed strings MUST stay byte-identical to the C++ (`detail::unsupported_*`)
+// and C (`xsqlc_unsupported_write`) ports and to the authorizer below.
+pub(crate) fn unsupported_write_message(verb: &str, table: &str, leaf: &str) -> String {
+    format!("{verb} {table} is not supported (capability mutation.{table}.{leaf} is unavailable)")
+}
+
+pub(crate) unsafe fn unsupported_insert(p_vtab: *mut ffi::sqlite3_vtab, table: &str) -> c_int {
+    unsafe {
+        set_vtab_error(
+            p_vtab,
+            &unsupported_write_message("INSERT INTO", table, "insert"),
+        );
+    }
+    ffi::SQLITE_ERROR
+}
+
+pub(crate) unsafe fn unsupported_delete(p_vtab: *mut ffi::sqlite3_vtab, table: &str) -> c_int {
+    unsafe {
+        set_vtab_error(
+            p_vtab,
+            &unsupported_write_message("DELETE FROM", table, "delete"),
+        );
+    }
+    ffi::SQLITE_ERROR
+}
+
+pub(crate) unsafe fn unsupported_update(p_vtab: *mut ffi::sqlite3_vtab, table: &str) -> c_int {
+    unsafe {
+        set_vtab_error(p_vtab, &unsupported_write_message("UPDATE", table, "*"));
+    }
+    ffi::SQLITE_ERROR
 }
 
 /// Finish a vtab callback returning `Result<()>`: on a returned error or a caught

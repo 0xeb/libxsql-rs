@@ -1,34 +1,42 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 use crate::error::{Error, Result, sqlite_ok};
 use crate::function::{FunctionArg, FunctionContext, build_args};
 use libsqlite3_sys as ffi;
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use super::cached::{CachedCount, CachedFilterFactory};
+use super::column_helpers;
 use super::ffi::{
     c_string_to_string, call_cached_modify_hook, callback_status, finish_cursor_unit,
-    finish_vtab_unit, parse_constraint_index_list, quote_identifier, set_vtab_error,
-    sqlite_mprintf_string, sqlite3_vtab_nochange,
+    finish_vtab_unit, parse_col_used, parse_constraint_index_list, quote_identifier,
+    set_vtab_error, sqlite_mprintf_string, sqlite3_vtab_nochange, unsupported_delete,
+    unsupported_insert, unsupported_update,
 };
 use super::index::InsertFn;
 use super::{
     ColumnType, ConstraintOp, ConstraintRequest, FILTER_NONE, Generator, GeneratorConstraintArg,
-    ModifyHook, RowIterator,
+    ModifyHook, RowIterator, TransactionHooks, TransactionLifecycle, WriteCaps,
+    WriteSurfaceRegistry, apply_update_columns, connect_write_surface, destroy_write_surface,
 };
 
 const MISSING_REQUIRED_CONSTRAINT: c_int = -2;
+const GENERATOR_COUNT_ONLY_SCAN: c_int = -1;
 const CONSTRAINT_FILTER_BASE: c_int = 2_000;
 const PARAMETRIC_FILTER_BASE: c_int = 500;
 
 type GeneratorFactory<Row> = dyn Fn() -> Box<dyn Generator<Row>> + 'static;
+// Projection-aware full-scan factory: receives SQLite's colUsed bitmask so it can skip
+// materializing expensive unused columns. Used for the full-scan plan when set.
+type ProjectionGeneratorFactory<Row> = dyn Fn(u64) -> Box<dyn Generator<Row>> + 'static;
 type GeneratorGetter<Row> = dyn for<'a> Fn(&mut FunctionContext<'a>, &Row) + 'static;
 type GeneratorSetter<Row> = dyn for<'a> Fn(&mut Row, &FunctionArg<'a>) -> bool + 'static;
 type GeneratorParametricFactory<Row> =
@@ -82,7 +90,9 @@ struct ConstraintFilterDef<Row> {
 struct GeneratorInner<Row> {
     name: String,
     estimate_rows: Option<Box<CachedCount>>,
-    generator: Box<GeneratorFactory<Row>>,
+    row_count: Option<Box<CachedCount>>,
+    generator: Option<Box<GeneratorFactory<Row>>>,
+    projection_generator: Option<Box<ProjectionGeneratorFactory<Row>>>,
     columns: Vec<GeneratorColumnDef<Row>>,
     filters: Vec<GeneratorFilterDef>,
     parametric_filters: Vec<ParametricFilterDef<Row>>,
@@ -90,6 +100,7 @@ struct GeneratorInner<Row> {
     full_scan_error: Option<String>,
     before_modify: Option<Box<ModifyHook>>,
     after_modify: Option<Box<ModifyHook>>,
+    transaction_hooks: TransactionHooks,
     delete_row: Option<Box<GeneratorDelete<Row>>>,
     insert_row: Option<Box<InsertFn>>,
     row_lookup: Option<Box<GeneratorLookup<Row>>>,
@@ -141,6 +152,28 @@ impl<Row> GeneratorTableDef<Row> {
     pub fn name(&self) -> &str {
         &self.inner.name
     }
+
+    /// Compute write-surface capabilities for the prepare-time authorizer
+    /// (mirrors the C++ generator `record_write_surface`): a generator
+    /// DELETE/UPDATE additionally requires a `row_lookup` to resolve the target
+    /// row, so deletable/updatable are gated on it.
+    pub(crate) fn write_caps(&self) -> super::WriteCaps {
+        let has_lookup = self.inner.row_lookup.is_some();
+        super::WriteCaps {
+            insertable: self.inner.insert_row.is_some(),
+            deletable: self.inner.delete_row.is_some() && has_lookup,
+            writable_columns: if has_lookup {
+                self.inner
+                    .columns
+                    .iter()
+                    .filter(|column| column.setter.is_some())
+                    .map(|column| column.name.to_ascii_lowercase())
+                    .collect()
+            } else {
+                Default::default()
+            },
+        }
+    }
 }
 
 /// Start a generator-backed virtual table definition.
@@ -148,7 +181,9 @@ pub fn generator_table<Row: 'static>(name: impl Into<String>) -> GeneratorTableB
     GeneratorTableBuilder {
         name: name.into(),
         estimate_rows: None,
+        row_count: None,
         generator: None,
+        projection_generator: None,
         columns: Vec::new(),
         filters: Vec::new(),
         parametric_filters: Vec::new(),
@@ -156,6 +191,7 @@ pub fn generator_table<Row: 'static>(name: impl Into<String>) -> GeneratorTableB
         full_scan_error: None,
         before_modify: None,
         after_modify: None,
+        transaction_hooks: TransactionHooks::default(),
         delete_row: None,
         insert_row: None,
         row_lookup: None,
@@ -166,7 +202,9 @@ pub fn generator_table<Row: 'static>(name: impl Into<String>) -> GeneratorTableB
 pub struct GeneratorTableBuilder<Row> {
     name: String,
     estimate_rows: Option<Box<CachedCount>>,
+    row_count: Option<Box<CachedCount>>,
     generator: Option<Box<GeneratorFactory<Row>>>,
+    projection_generator: Option<Box<ProjectionGeneratorFactory<Row>>>,
     columns: Vec<GeneratorColumnDef<Row>>,
     filters: Vec<GeneratorFilterDef>,
     parametric_filters: Vec<ParametricFilterDef<Row>>,
@@ -174,6 +212,7 @@ pub struct GeneratorTableBuilder<Row> {
     full_scan_error: Option<String>,
     before_modify: Option<Box<ModifyHook>>,
     after_modify: Option<Box<ModifyHook>>,
+    transaction_hooks: TransactionHooks,
     delete_row: Option<Box<GeneratorDelete<Row>>>,
     insert_row: Option<Box<InsertFn>>,
     row_lookup: Option<Box<GeneratorLookup<Row>>>,
@@ -189,12 +228,32 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
         self
     }
 
+    /// Set an exact cheap row count for bare `COUNT(*)` queries.
+    pub fn row_count<F>(mut self, row_count: F) -> Self
+    where
+        F: Fn() -> usize + 'static,
+    {
+        self.row_count = Some(Box::new(row_count));
+        self
+    }
+
     /// Set the factory that produces a fresh [`Generator`] for a full scan.
     pub fn generator<F>(mut self, generator: F) -> Self
     where
         F: Fn() -> Box<dyn Generator<Row>> + 'static,
     {
         self.generator = Some(Box::new(generator));
+        self
+    }
+
+    /// Set a projection-aware full-scan factory that receives SQLite's `colUsed`
+    /// bitmask so it can skip materializing expensive unused columns. Used for the
+    /// full-scan plan when set; otherwise [`generator`](Self::generator) is used.
+    pub fn projection_generator<F>(mut self, generator: F) -> Self
+    where
+        F: Fn(u64) -> Box<dyn Generator<Row>> + 'static,
+    {
+        self.projection_generator = Some(Box::new(generator));
         self
     }
 
@@ -225,20 +284,19 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
         self
     }
 
+    /// Install the complete SQLite transaction lifecycle for this table.
+    pub fn transaction_hooks(mut self, transaction_hooks: TransactionHooks) -> Self {
+        self.transaction_hooks = transaction_hooks;
+        self
+    }
+
     /// Add a column with a custom getter that writes the value for a row
     /// reference into the context.
-    pub fn column<F>(mut self, name: impl Into<String>, column_type: ColumnType, getter: F) -> Self
+    pub fn column<F>(self, name: impl Into<String>, column_type: ColumnType, getter: F) -> Self
     where
         F: for<'a> Fn(&mut FunctionContext<'a>, &Row) + 'static,
     {
-        self.columns.push(GeneratorColumnDef {
-            name: name.into(),
-            column_type,
-            getter: Box::new(getter),
-            setter: None,
-            hidden: false,
-        });
-        self
+        self.add_column(name, column_type, Box::new(getter), None, false)
     }
 
     /// Add an `INTEGER` column whose getter returns an `i32` for a row.
@@ -246,9 +304,13 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
     where
         F: Fn(&Row) -> i32 + 'static,
     {
-        self.column(name, ColumnType::Integer, move |ctx, row| {
-            ctx.result_int(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::row_getter_int(getter),
+            None,
+            false,
+        )
     }
 
     /// Add an `INTEGER` column whose getter returns an `i64` for a row.
@@ -256,9 +318,13 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
     where
         F: Fn(&Row) -> i64 + 'static,
     {
-        self.column(name, ColumnType::Integer, move |ctx, row| {
-            ctx.result_i64(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::row_getter_i64(getter),
+            None,
+            false,
+        )
     }
 
     /// Alias for [`column_i64`](Self::column_i64).
@@ -274,9 +340,13 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
     where
         F: Fn(&Row) -> String + 'static,
     {
-        self.column(name, ColumnType::Text, move |ctx, row| {
-            ctx.result_text(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Text,
+            column_helpers::row_getter_text(getter),
+            None,
+            false,
+        )
     }
 
     /// Add a `REAL` column whose getter returns an `f64` for a row.
@@ -284,9 +354,13 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
     where
         F: Fn(&Row) -> f64 + 'static,
     {
-        self.column(name, ColumnType::Real, move |ctx, row| {
-            ctx.result_double(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Real,
+            column_helpers::row_getter_double(getter),
+            None,
+            false,
+        )
     }
 
     /// Add a `BLOB` column whose getter returns a `Vec<u8>` for a row.
@@ -294,15 +368,19 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
     where
         F: Fn(&Row) -> Vec<u8> + 'static,
     {
-        self.column(name, ColumnType::Blob, move |ctx, row| {
-            ctx.result_blob(&getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Blob,
+            column_helpers::row_getter_blob(getter),
+            None,
+            false,
+        )
     }
 
     /// Add a writable column with a custom getter and setter operating on a row
     /// reference.
     pub fn column_rw<G, S>(
-        mut self,
+        self,
         name: impl Into<String>,
         column_type: ColumnType,
         getter: G,
@@ -312,48 +390,45 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
         G: for<'a> Fn(&mut FunctionContext<'a>, &Row) + 'static,
         S: for<'a> Fn(&mut Row, &FunctionArg<'a>) -> bool + 'static,
     {
-        self.columns.push(GeneratorColumnDef {
-            name: name.into(),
+        self.add_column(
+            name,
             column_type,
-            getter: Box::new(getter),
-            setter: Some(Box::new(setter)),
-            hidden: false,
-        });
-        self
+            Box::new(getter),
+            Some(Box::new(setter)),
+            false,
+        )
     }
 
     /// Add a writable `INTEGER` (`i32`) column; the setter returns false to
     /// reject the write.
-    pub fn column_int_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_int_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> i32 + 'static,
         S: Fn(&mut Row, i32) -> bool + 'static,
     {
-        self.columns.push(GeneratorColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Integer,
-            getter: Box::new(move |ctx, row| ctx.result_int(getter(row))),
-            setter: Some(Box::new(move |row, value| setter(row, value.as_i32()))),
-            hidden: false,
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::row_getter_int(getter),
+            Some(column_helpers::row_setter_int(setter)),
+            false,
+        )
     }
 
     /// Add a writable `INTEGER` (`i64`) column; the setter returns false to
     /// reject the write.
-    pub fn column_i64_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_i64_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> i64 + 'static,
         S: Fn(&mut Row, i64) -> bool + 'static,
     {
-        self.columns.push(GeneratorColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Integer,
-            getter: Box::new(move |ctx, row| ctx.result_i64(getter(row))),
-            setter: Some(Box::new(move |row, value| setter(row, value.as_i64()))),
-            hidden: false,
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::row_getter_i64(getter),
+            Some(column_helpers::row_setter_i64(setter)),
+            false,
+        )
     }
 
     /// Alias for [`column_i64_rw`](Self::column_i64_rw).
@@ -367,28 +442,24 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
 
     /// Add a writable `TEXT` column; the setter returns false to reject the
     /// write.
-    pub fn column_text_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_text_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> String + 'static,
         S: Fn(&mut Row, &str) -> bool + 'static,
     {
-        self.columns.push(GeneratorColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Text,
-            getter: Box::new(move |ctx, row| ctx.result_text(getter(row))),
-            setter: Some(Box::new(move |row, value| {
-                let text = value.as_c_str().map(CStr::to_string_lossy);
-                setter(row, text.as_deref().unwrap_or(""))
-            })),
-            hidden: false,
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Text,
+            column_helpers::row_getter_text(getter),
+            Some(column_helpers::row_setter_text(setter)),
+            false,
+        )
     }
 
     /// Add a writable `TEXT` column whose getter may return `None` (emitting SQL
     /// NULL); the setter receives the raw argument.
     pub fn column_text_nullable_rw<G, S>(
-        mut self,
+        self,
         name: impl Into<String>,
         getter: G,
         setter: S,
@@ -397,51 +468,45 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
         G: Fn(&Row) -> Option<String> + 'static,
         S: for<'a> Fn(&mut Row, &FunctionArg<'a>) -> bool + 'static,
     {
-        self.columns.push(GeneratorColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Text,
-            getter: Box::new(move |ctx, row| match getter(row) {
-                Some(value) => ctx.result_text(value),
-                None => ctx.result_null(),
-            }),
-            setter: Some(Box::new(setter)),
-            hidden: false,
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Text,
+            column_helpers::row_getter_nullable_text(getter),
+            Some(Box::new(setter)),
+            false,
+        )
     }
 
     /// Add a writable `REAL` column; the setter returns false to reject the
     /// write.
-    pub fn column_double_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_double_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> f64 + 'static,
         S: Fn(&mut Row, f64) -> bool + 'static,
     {
-        self.columns.push(GeneratorColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Real,
-            getter: Box::new(move |ctx, row| ctx.result_double(getter(row))),
-            setter: Some(Box::new(move |row, value| setter(row, value.as_f64()))),
-            hidden: false,
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Real,
+            column_helpers::row_getter_double(getter),
+            Some(column_helpers::row_setter_double(setter)),
+            false,
+        )
     }
 
     /// Add a writable `BLOB` column; the setter returns false to reject the
     /// write.
-    pub fn column_blob_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_blob_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> Vec<u8> + 'static,
         S: Fn(&mut Row, &[u8]) -> bool + 'static,
     {
-        self.columns.push(GeneratorColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Blob,
-            getter: Box::new(move |ctx, row| ctx.result_blob(&getter(row))),
-            setter: Some(Box::new(move |row, value| setter(row, value.as_blob()))),
-            hidden: false,
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Blob,
+            column_helpers::row_getter_blob(getter),
+            Some(column_helpers::row_setter_blob(setter)),
+            false,
+        )
     }
 
     /// Add a hidden `INTEGER` column (usable as a constraint input but not
@@ -624,17 +689,19 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
 
     /// Finalize the definition; errors if no generator callback was set.
     pub fn build(self) -> Result<GeneratorTableDef<Row>> {
-        let Some(generator) = self.generator else {
+        if self.generator.is_none() && self.projection_generator.is_none() {
             return Err(Error::Message(format!(
                 "generator table '{}' is missing a generator callback",
                 self.name
             )));
-        };
+        }
         Ok(GeneratorTableDef {
             inner: Rc::new(GeneratorInner {
                 name: self.name,
                 estimate_rows: self.estimate_rows,
-                generator,
+                row_count: self.row_count,
+                generator: self.generator,
+                projection_generator: self.projection_generator,
                 columns: self.columns,
                 filters: self.filters,
                 parametric_filters: self.parametric_filters,
@@ -642,6 +709,7 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
                 full_scan_error: self.full_scan_error,
                 before_modify: self.before_modify,
                 after_modify: self.after_modify,
+                transaction_hooks: self.transaction_hooks,
                 delete_row: self.delete_row,
                 insert_row: self.insert_row,
                 row_lookup: self.row_lookup,
@@ -649,13 +717,30 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
         })
     }
 
-    fn hidden_column(mut self, name: impl Into<String>, column_type: ColumnType) -> Self {
+    fn hidden_column(self, name: impl Into<String>, column_type: ColumnType) -> Self {
+        self.add_column(
+            name,
+            column_type,
+            column_helpers::row_getter_null(),
+            None,
+            true,
+        )
+    }
+
+    fn add_column(
+        mut self,
+        name: impl Into<String>,
+        column_type: ColumnType,
+        getter: Box<GeneratorGetter<Row>>,
+        setter: Option<Box<GeneratorSetter<Row>>>,
+        hidden: bool,
+    ) -> Self {
         self.columns.push(GeneratorColumnDef {
             name: name.into(),
             column_type,
-            getter: Box::new(|ctx, _row| ctx.result_null()),
-            setter: None,
-            hidden: true,
+            getter,
+            setter,
+            hidden,
         });
         self
     }
@@ -692,12 +777,18 @@ impl<Row: 'static> GeneratorTableBuilder<Row> {
 struct GeneratorModuleState<Row> {
     module: ffi::sqlite3_module,
     def: Rc<GeneratorInner<Row>>,
+    registry: *const RefCell<WriteSurfaceRegistry>,
+    caps: WriteCaps,
 }
 
 #[repr(C)]
 struct GeneratorVtab<Row> {
     base: ffi::sqlite3_vtab,
     def: Rc<GeneratorInner<Row>>,
+    transaction: TransactionLifecycle,
+    registry: *const RefCell<WriteSurfaceRegistry>,
+    schema_name: String,
+    table_name: String,
 }
 
 #[repr(C)]
@@ -708,10 +799,13 @@ struct GeneratorCursor<Row> {
     generator: Option<Box<dyn Generator<Row>>>,
     iterator: Option<Box<dyn RowIterator>>,
     eof: bool,
+    count_only_total: Option<usize>,
+    count_only_row: usize,
 }
 
 pub(crate) fn register_generator_table<Row: 'static>(
     db: *mut ffi::sqlite3,
+    registry: *const RefCell<WriteSurfaceRegistry>,
     module_name: &str,
     def: &GeneratorTableDef<Row>,
 ) -> Result<()> {
@@ -722,6 +816,8 @@ pub(crate) fn register_generator_table<Row: 'static>(
     let state = Box::new(GeneratorModuleState {
         module: create_generator_module::<Row>(),
         def: def.inner.clone(),
+        registry,
+        caps: def.write_caps(),
     });
     let state_ptr = Box::into_raw(state);
     let module_ptr = unsafe { &(*state_ptr).module as *const ffi::sqlite3_module };
@@ -748,7 +844,7 @@ fn create_generator_module<Row: 'static>() -> ffi::sqlite3_module {
     module.xConnect = Some(generator_vtab_connect::<Row>);
     module.xBestIndex = Some(generator_vtab_best_index::<Row>);
     module.xDisconnect = Some(generator_vtab_disconnect::<Row>);
-    module.xDestroy = Some(generator_vtab_disconnect::<Row>);
+    module.xDestroy = Some(generator_vtab_destroy::<Row>);
     module.xOpen = Some(generator_vtab_open::<Row>);
     module.xClose = Some(generator_vtab_close::<Row>);
     module.xFilter = Some(generator_vtab_filter::<Row>);
@@ -757,6 +853,15 @@ fn create_generator_module<Row: 'static>() -> ffi::sqlite3_module {
     module.xColumn = Some(generator_vtab_column::<Row>);
     module.xRowid = Some(generator_vtab_rowid::<Row>);
     module.xUpdate = Some(generator_vtab_update::<Row>);
+    // xBegin enrolls the vtab. Run the fallible hook in xSync, whose error
+    // SQLite propagates; xCommit only clears state.
+    module.xBegin = Some(generator_vtab_begin::<Row>);
+    module.xSync = Some(generator_vtab_sync::<Row>);
+    module.xCommit = Some(generator_vtab_commit::<Row>);
+    module.xRollback = Some(generator_vtab_rollback::<Row>);
+    module.xSavepoint = Some(generator_vtab_savepoint::<Row>);
+    module.xRelease = Some(generator_vtab_release::<Row>);
+    module.xRollbackTo = Some(generator_vtab_rollback_to::<Row>);
     module
 }
 
@@ -771,8 +876,8 @@ unsafe extern "C" fn destroy_generator_module_state<Row>(ptr: *mut c_void) {
 unsafe extern "C" fn generator_vtab_connect<Row>(
     db: *mut ffi::sqlite3,
     p_aux: *mut c_void,
-    _argc: c_int,
-    _argv: *const *const c_char,
+    argc: c_int,
+    argv: *const *const c_char,
     pp_vtab: *mut *mut ffi::sqlite3_vtab,
     pz_err: *mut *mut c_char,
 ) -> c_int {
@@ -787,14 +892,32 @@ unsafe extern "C" fn generator_vtab_connect<Row>(
             if !sqlite_ok(rc) {
                 return Err(Error::sqlite(rc, crate::function::sqlite_error(db)));
             }
+            let transaction = TransactionLifecycle::new(&state.def.transaction_hooks)?;
+            let (schema_name, table_name) =
+                connect_write_surface(state.registry, argc, argv, state.caps.clone())?;
             let vtab = Box::new(GeneratorVtab {
                 base: std::mem::zeroed(),
                 def: state.def.clone(),
+                transaction,
+                registry: state.registry,
+                schema_name,
+                table_name,
             });
             let vtab_ptr = Box::into_raw(vtab);
             *pp_vtab = &mut (*vtab_ptr).base;
             Ok(ffi::SQLITE_OK)
         })
+    }
+}
+
+unsafe extern "C" fn generator_vtab_destroy<Row>(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if !p_vtab.is_null() {
+            let vtab = Box::from_raw(p_vtab.cast::<GeneratorVtab<Row>>());
+            destroy_write_surface(vtab.registry, &vtab.schema_name, &vtab.table_name);
+            drop(vtab);
+        }
+        ffi::SQLITE_OK
     }
 }
 
@@ -824,6 +947,8 @@ unsafe extern "C" fn generator_vtab_open<Row>(
                 generator: None,
                 iterator: None,
                 eof: false,
+                count_only_total: None,
+                count_only_row: 0,
             });
             let cursor_ptr = Box::into_raw(cursor);
             *pp_cursor = &mut (*cursor_ptr).base;
@@ -858,6 +983,17 @@ unsafe extern "C" fn generator_vtab_filter<Row>(
             cursor.generator = None;
             cursor.iterator = None;
             cursor.eof = false;
+            cursor.count_only_total = None;
+            cursor.count_only_row = 0;
+
+            if idx_num == GENERATOR_COUNT_ONLY_SCAN && argc == 0 {
+                let row_count =
+                    cursor.def.row_count.as_ref().ok_or_else(|| {
+                        Error::Message("generator row count is unavailable".into())
+                    })?;
+                cursor.count_only_total = Some(row_count());
+                return Ok(());
+            }
 
             if idx_num == MISSING_REQUIRED_CONSTRAINT {
                 let message = c_string_to_string(idx_str)
@@ -927,7 +1063,16 @@ unsafe extern "C" fn generator_vtab_filter<Row>(
                 return Err(Error::Message(message.clone()));
             }
 
-            let mut generator = (cursor.def.generator)();
+            let mut generator = if let Some(projection) = cursor.def.projection_generator.as_ref() {
+                projection(parse_col_used(idx_str))
+            } else {
+                // build() guarantees a plain generator when there is no projection factory.
+                (cursor
+                    .def
+                    .generator
+                    .as_ref()
+                    .expect("generator or projection_generator"))()
+            };
             cursor.eof = !generator.next()?;
             cursor.generator = Some(generator);
             Ok(())
@@ -943,7 +1088,9 @@ unsafe extern "C" fn generator_vtab_next<Row>(cursor: *mut ffi::sqlite3_vtab_cur
                 .cast::<GeneratorCursor<Row>>()
                 .as_mut()
                 .ok_or_else(|| Error::Message("xsql generator cursor is null".to_string()))?;
-            if let Some(iterator) = cursor.iterator.as_mut() {
+            if cursor.count_only_total.is_some() {
+                cursor.count_only_row += 1;
+            } else if let Some(iterator) = cursor.iterator.as_mut() {
                 cursor.eof = !iterator.next()?;
             } else if let Some(generator) = cursor.generator.as_mut() {
                 cursor.eof = !generator.next()?;
@@ -961,8 +1108,46 @@ unsafe extern "C" fn generator_vtab_eof<Row>(cursor: *mut ffi::sqlite3_vtab_curs
         let Some(cursor) = cursor.cast::<GeneratorCursor<Row>>().as_ref() else {
             return 1;
         };
+        if let Some(total) = cursor.count_only_total {
+            return i32::from(cursor.count_only_row >= total);
+        }
         i32::from(cursor.eof || (cursor.generator.is_none() && cursor.iterator.is_none()))
     }
+}
+
+fn materialize_count_only_generator<Row>(
+    cursor: &mut GeneratorCursor<Row>,
+    col_used: u64,
+) -> Result<()> {
+    if cursor.count_only_total.is_none() {
+        return Ok(());
+    }
+    let position = cursor.count_only_row;
+    let mut generator = if let Some(projection) = cursor.def.projection_generator.as_ref() {
+        projection(col_used)
+    } else {
+        (cursor
+            .def
+            .generator
+            .as_ref()
+            .expect("generator or projection_generator"))()
+    };
+    let mut available = generator.next()?;
+    for _ in 0..position {
+        if !available {
+            break;
+        }
+        available = generator.next()?;
+    }
+    cursor.count_only_total = None;
+    cursor.eof = !available;
+    cursor.generator = Some(generator);
+    if !available {
+        return Err(Error::Message(
+            "generator row_count() exceeded the rows produced by generator()".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 unsafe extern "C" fn generator_vtab_column<Row>(
@@ -981,9 +1166,17 @@ unsafe extern "C" fn generator_vtab_column<Row>(
             }
             let cursor = cursor
                 .cast::<GeneratorCursor<Row>>()
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| Error::Message("xsql generator cursor is null".to_string()))?;
             let mut fctx = FunctionContext::new(ctx);
+            if cursor.count_only_total.is_some() {
+                let col_used = if (0..63).contains(&col) {
+                    1_u64 << col
+                } else {
+                    1_u64 << 63
+                };
+                materialize_count_only_generator(cursor, col_used)?;
+            }
             if cursor.eof || col < 0 || col as usize >= cursor.def.columns.len() {
                 fctx.result_null();
                 return Ok(());
@@ -1021,8 +1214,11 @@ unsafe extern "C" fn generator_vtab_rowid<Row>(
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
             let cursor = cursor
                 .cast::<GeneratorCursor<Row>>()
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| Error::Message("xsql generator cursor is null".to_string()))?;
+            if cursor.count_only_total.is_some() {
+                materialize_count_only_generator(cursor, 0)?;
+            }
             if let Some(iterator) = cursor.iterator.as_ref() {
                 *rowid = if cursor.eof { 0 } else { iterator.rowid() };
                 return Ok(());
@@ -1057,11 +1253,14 @@ unsafe extern "C" fn generator_vtab_update<Row: 'static>(
 
             let old_rowid = FunctionArg::new(*argv);
             if argc == 1 && !old_rowid.is_null() {
+                // A generator DELETE needs both a delete callback AND a row_lookup
+                // to resolve the target row; missing either makes the surface
+                // unsupported (matches the recorded caps and the C++ port).
                 let Some(delete_row) = vtab.def.delete_row.as_ref() else {
-                    return Ok(ffi::SQLITE_READONLY);
+                    return Ok(unsupported_delete(p_vtab, &vtab.def.name));
                 };
                 let Some(row_lookup) = vtab.def.row_lookup.as_ref() else {
-                    return Ok(ffi::SQLITE_READONLY);
+                    return Ok(unsupported_delete(p_vtab, &vtab.def.name));
                 };
                 let Some(row) = row_lookup(old_rowid.as_i64()) else {
                     return Err(Error::Message(
@@ -1069,25 +1268,30 @@ unsafe extern "C" fn generator_vtab_update<Row: 'static>(
                     ));
                 };
                 let operation = format!("DELETE FROM {}", vtab.def.name);
+                vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
                 if delete_row(&row) {
                     call_cached_modify_hook(&vtab.def.after_modify, &operation);
+                    vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
                 return Err(Error::Message("generator table delete failed".to_string()));
             }
 
             if argc > 1 && !old_rowid.is_null() {
+                // A generator UPDATE needs both a writable column AND a row_lookup;
+                // missing either makes the surface unsupported (matches the
+                // recorded caps and the C++ port).
                 if !vtab
                     .def
                     .columns
                     .iter()
                     .any(|column| column.setter.is_some())
                 {
-                    return Ok(ffi::SQLITE_READONLY);
+                    return Ok(unsupported_update(p_vtab, &vtab.def.name));
                 }
                 let Some(row_lookup) = vtab.def.row_lookup.as_ref() else {
-                    return Ok(ffi::SQLITE_READONLY);
+                    return Ok(unsupported_update(p_vtab, &vtab.def.name));
                 };
                 let Some(mut row) = row_lookup(old_rowid.as_i64()) else {
                     return Err(Error::Message(
@@ -1095,18 +1299,21 @@ unsafe extern "C" fn generator_vtab_update<Row: 'static>(
                     ));
                 };
                 let operation = format!("UPDATE {}", vtab.def.name);
+                vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
                 let args = build_args(argc - 2, argv.add(2));
                 apply_generator_setters(&vtab.def, &mut row, &args)?;
                 call_cached_modify_hook(&vtab.def.after_modify, &operation);
+                vtab.transaction.mark_written();
                 return Ok(ffi::SQLITE_OK);
             }
 
             if argc > 1 && old_rowid.is_null() {
                 let Some(insert_row) = vtab.def.insert_row.as_ref() else {
-                    return Ok(ffi::SQLITE_READONLY);
+                    return Ok(unsupported_insert(p_vtab, &vtab.def.name));
                 };
                 let operation = format!("INSERT INTO {}", vtab.def.name);
+                vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
                 let args = build_args(argc - 2, argv.add(2));
                 if insert_row(&args) {
@@ -1114,6 +1321,7 @@ unsafe extern "C" fn generator_vtab_update<Row: 'static>(
                         *rowid = 0;
                     }
                     call_cached_modify_hook(&vtab.def.after_modify, &operation);
+                    vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
                 return Err(Error::Message("generator table insert failed".to_string()));
@@ -1148,6 +1356,21 @@ unsafe extern "C" fn generator_vtab_best_index<Row>(
             let info = index_info
                 .as_mut()
                 .ok_or_else(|| Error::Message("sqlite index_info is null".to_string()))?;
+            if info.nConstraint == 0
+                && info.colUsed == 0
+                && let Some(row_count) = vtab.def.row_count.as_ref()
+            {
+                let estimated_rows = vtab
+                    .def
+                    .estimate_rows
+                    .as_ref()
+                    .map(|estimate| estimate())
+                    .unwrap_or_else(row_count);
+                info.idxNum = GENERATOR_COUNT_ONLY_SCAN;
+                info.estimatedCost = estimated_rows as f64;
+                info.estimatedRows = estimated_rows as i64;
+                return Ok(());
+            }
             let mut best_constraint_filter: Option<&ConstraintFilterDef<Row>> = None;
             let mut best_matched_constraints = Vec::new();
             let mut best_consumes_order = false;
@@ -1330,7 +1553,112 @@ unsafe extern "C" fn generator_vtab_best_index<Row>(
             info.idxNum = FILTER_NONE;
             info.estimatedCost = estimated_rows as f64;
             info.estimatedRows = estimated_rows as i64;
+            // Carry colUsed to xFilter via idxStr (like the cached table) so a
+            // projection-aware generator can skip expensive unused columns. Only the
+            // FILTER_NONE plan uses idxStr here (filter/constraint plans returned above).
+            if vtab.def.projection_generator.is_some() {
+                let idx_str = sqlite_mprintf_string(&info.colUsed.to_string());
+                if !idx_str.is_null() {
+                    info.idxStr = idx_str;
+                    info.needToFreeIdxStr = 1;
+                }
+            }
             Ok(())
+        }));
+        finish_vtab_unit(p_vtab, result)
+    }
+}
+
+unsafe extern "C" fn generator_vtab_begin<Row>(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if let Some(vtab) = p_vtab.cast::<GeneratorVtab<Row>>().as_ref() {
+            vtab.transaction.begin();
+        }
+        ffi::SQLITE_OK
+    }
+}
+
+unsafe extern "C" fn generator_vtab_sync<Row>(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<GeneratorVtab<Row>>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql generator vtab is null".to_string()))?;
+            vtab.transaction.sync(&vtab.def.transaction_hooks)
+        }));
+        finish_vtab_unit(p_vtab, result)
+    }
+}
+
+unsafe extern "C" fn generator_vtab_commit<Row>(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if let Some(vtab) = p_vtab.cast::<GeneratorVtab<Row>>().as_ref() {
+            // SQLite ignores xCommit/xRollback errors. Contain a panic without
+            // leaving an ignored allocation in zErrMsg.
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                vtab.transaction.commit(&vtab.def.transaction_hooks);
+            }));
+        }
+        ffi::SQLITE_OK
+    }
+}
+
+unsafe extern "C" fn generator_vtab_rollback<Row>(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if let Some(vtab) = p_vtab.cast::<GeneratorVtab<Row>>().as_ref() {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                vtab.transaction.rollback(&vtab.def.transaction_hooks);
+            }));
+        }
+        ffi::SQLITE_OK
+    }
+}
+
+unsafe extern "C" fn generator_vtab_savepoint<Row>(
+    p_vtab: *mut ffi::sqlite3_vtab,
+    id: c_int,
+) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<GeneratorVtab<Row>>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql generator vtab is null".to_string()))?;
+            vtab.transaction.savepoint(&vtab.def.transaction_hooks, id)
+        }));
+        finish_vtab_unit(p_vtab, result)
+    }
+}
+
+unsafe extern "C" fn generator_vtab_release<Row>(
+    p_vtab: *mut ffi::sqlite3_vtab,
+    id: c_int,
+) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<GeneratorVtab<Row>>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql generator vtab is null".to_string()))?;
+            vtab.transaction.release(&vtab.def.transaction_hooks, id)
+        }));
+        finish_vtab_unit(p_vtab, result)
+    }
+}
+
+unsafe extern "C" fn generator_vtab_rollback_to<Row>(
+    p_vtab: *mut ffi::sqlite3_vtab,
+    id: c_int,
+) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<GeneratorVtab<Row>>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql generator vtab is null".to_string()))?;
+            vtab.transaction
+                .rollback_to(&vtab.def.transaction_hooks, id)
         }));
         finish_vtab_unit(p_vtab, result)
     }
@@ -1341,21 +1669,19 @@ fn apply_generator_setters<'a, Row>(
     row: &mut Row,
     args: &[FunctionArg<'a>],
 ) -> Result<()> {
-    for (column_index, value) in args.iter().enumerate() {
-        if value.is_nochange() {
-            continue;
-        }
-        let Some(column) = def.columns.get(column_index) else {
-            break;
-        };
-        if let Some(setter) = column.setter.as_ref()
-            && !setter(row, value)
-        {
-            return Err(Error::Message(format!(
-                "generator table update failed for column '{}'",
-                column.name
-            )));
-        }
-    }
-    Ok(())
+    // Generator updates always resolve the row from its rowid via row_lookup, so
+    // unchanged columns arrive as NOCHANGE -- always NOCHANGE-eligible.
+    apply_update_columns(
+        args,
+        def.columns.len(),
+        true,
+        |i| def.columns[i].setter.is_some(),
+        |i| def.columns[i].name.clone(),
+        |i, value| {
+            def.columns[i]
+                .setter
+                .as_ref()
+                .expect("apply runs only for writable columns")(row, value)
+        },
+    )
 }

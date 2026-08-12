@@ -1,8 +1,8 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 use crate::error::{Error, Result, Status};
 use crate::statement::StepResult;
@@ -17,6 +17,20 @@ use std::slice;
 pub struct FunctionArg<'a> {
     value: ValueRef<'a>,
 }
+
+// FunctionArg intentionally remains a pointer-sized wrapper over ValueRef.
+// build_args() copies SQLite argv pointers into a Vec<FunctionArg>, so this is a
+// wrapper invariant rather than C++-style argv aliasing.
+const _: () = {
+    assert!(
+        std::mem::size_of::<FunctionArg<'static>>()
+            == std::mem::size_of::<*mut ffi::sqlite3_value>()
+    );
+    assert!(
+        std::mem::align_of::<FunctionArg<'static>>()
+            == std::mem::align_of::<*mut ffi::sqlite3_value>()
+    );
+};
 
 impl<'a> FunctionArg<'a> {
     pub(crate) fn new(raw: *mut ffi::sqlite3_value) -> Self {

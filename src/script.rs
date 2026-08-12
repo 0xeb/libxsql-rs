@@ -1,21 +1,61 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
-use crate::{Database, Error, Result, ScriptExecutionMode, StepResult};
+use crate::table_printer::{self, TablePrintOptions};
+use crate::{Database, Error, Result, ScriptExecutionMode};
 use libsqlite3_sys as ffi;
 use std::ffi::CString;
-use std::time::Instant;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// Options for the canonical multi-statement SQL runner.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Carries an optional [`should_cancel`](ScriptOptions::should_cancel) closure, so
+/// it is [`Clone`] but not `Copy`/`PartialEq`.
+#[derive(Clone, Default)]
 pub struct ScriptOptions {
     /// Keep running subsequent statements after one fails (otherwise stop at the first error).
     pub continue_on_error: bool,
     /// Record each statement's source SQL in its [`StatementResult::sql`].
     pub include_sql: bool,
+    /// Per-statement wall-clock timeout in milliseconds (`0` = no limit). Threaded
+    /// into each statement's [`QueryOptions::timeout_ms`](crate::database::QueryOptions);
+    /// a read-only statement that hits the deadline comes back `success` with
+    /// `partial`/`timed_out` set and a warning. A mutation reports an error and
+    /// rolls back instead.
+    pub timeout_ms: u64,
+    /// Optional cooperative cancellation predicate. When set and it returns `true`,
+    /// an in-flight read-only statement stops ASAP and comes back `success` with
+    /// `partial` set and a "query cancelled" warning (same shape as a timeout,
+    /// but **not** `timed_out` — cancel is not a timeout). A mutation is rolled
+    /// back and reports an error. Cancellation is sticky for the whole script:
+    /// once observed, no later statement starts even if the original predicate
+    /// subsequently returns `false`. Threaded into the buffered path
+    /// ([`QueryOptions::should_cancel`](crate::database::QueryOptions), which folds it
+    /// into the progress handler / interrupt checker) and checked *between* statements
+    /// by [`run_script_with_executor`], so a server can abort a runaway script even
+    /// under `timeout_ms == 0`. `None` => never cancelled.
+    pub should_cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ScriptOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptOptions")
+            .field("continue_on_error", &self.continue_on_error)
+            .field("include_sql", &self.include_sql)
+            .field("timeout_ms", &self.timeout_ms)
+            .field(
+                "should_cancel",
+                &self.should_cancel.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
 }
 
 /// Output for one SQL statement inside a script.
@@ -38,6 +78,13 @@ pub struct StatementResult {
     pub error: Option<String>,
     /// Source SQL of the statement (populated only when [`ScriptOptions::include_sql`] is set).
     pub sql: String,
+    /// `true` if this statement hit its deadline (see [`ScriptOptions::timeout_ms`]).
+    pub timed_out: bool,
+    /// `true` if a read-only timeout, cancellation, or late provider error kept
+    /// the rows gathered so far.
+    pub partial: bool,
+    /// Non-fatal notices — e.g. the partial-rows timeout warning.
+    pub warnings: Vec<String>,
 }
 
 impl StatementResult {
@@ -55,6 +102,43 @@ impl StatementResult {
 
 /// Alias for [`StatementResult`], matching the C++ reference's type name.
 pub type ScriptStatementResult = StatementResult;
+
+fn poll_cancellation(
+    predicate: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> std::result::Result<bool, &'static str> {
+    let Some(predicate) = predicate else {
+        return Ok(false);
+    };
+    catch_unwind(AssertUnwindSafe(|| predicate())).map_err(|_| "cancellation predicate panicked")
+}
+
+fn with_sticky_cancellation(mut options: ScriptOptions) -> ScriptOptions {
+    let Some(predicate) = options.should_cancel.take() else {
+        return options;
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let panicked = Arc::new(AtomicBool::new(false));
+    options.should_cancel = Some(Arc::new(move || {
+        if panicked.load(Ordering::Acquire) {
+            panic!("cancellation predicate panicked");
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return true;
+        }
+        match catch_unwind(AssertUnwindSafe(|| predicate())) {
+            Ok(true) => {
+                cancelled.store(true, Ordering::Release);
+                true
+            }
+            Ok(false) => false,
+            Err(payload) => {
+                panicked.store(true, Ordering::Release);
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }));
+    options
+}
 
 /// Aggregated result for a multi-statement script run.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -152,6 +236,7 @@ pub fn run_script(
     let options = ScriptOptions {
         continue_on_error: mode == ScriptExecutionMode::ContinueOnError,
         include_sql: true,
+        ..Default::default()
     };
     let result = run_database_script(db, script, options);
     if result.parse_error.is_empty() {
@@ -170,20 +255,44 @@ pub fn run_database_script(
     script: &str,
     options: ScriptOptions,
 ) -> ScriptResult {
+    let options = with_sticky_cancellation(options);
+    // Snapshot the fields the per-statement executor needs, so `options` itself can
+    // still be moved into `run_script_with_executor` for the between-statement
+    // cancel check.
+    let timeout_ms = options.timeout_ms;
+    let should_cancel = options.should_cancel.clone();
     run_script_with_executor(script, options, |sql, out| {
-        let statement_started = Instant::now();
-        match run_one_statement(db, sql) {
-            Ok(mut result) => {
-                result.success = true;
-                result.elapsed_ms = statement_started.elapsed().as_millis() as f64;
-                *out = result;
-            }
-            Err(error) => {
-                out.success = false;
-                out.error = Some(error.to_string());
-                out.elapsed_ms = statement_started.elapsed().as_millis() as f64;
-            }
-        }
+        // Reuse Database::query_with_options, which owns the timeout + cancellation
+        // machinery (progress handler + interrupt checker + partial-result flags),
+        // and round-trip its signalling into the statement result. Mirrors the C++
+        // run_database_script executor (which sets qopts.should_cancel too).
+        let outcome = db.query_with_options(
+            sql,
+            crate::database::QueryOptions {
+                timeout_ms,
+                should_cancel: should_cancel.clone(),
+                ..Default::default()
+            },
+        );
+        out.columns = outcome.result.columns;
+        out.rows = outcome
+            .result
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.values
+                    .into_iter()
+                    .zip(row.nulls)
+                    .map(|(value, is_null)| if is_null { None } else { Some(value) })
+                    .collect()
+            })
+            .collect();
+        out.elapsed_ms = outcome.elapsed_ms as f64;
+        out.success = outcome.error.is_none();
+        out.error = outcome.error;
+        out.timed_out = outcome.timed_out;
+        out.partial = outcome.partial;
+        out.warnings = outcome.warnings;
     })
 }
 
@@ -202,6 +311,7 @@ pub fn run_script_with_executor<F>(
 where
     F: FnMut(&str, &mut StatementResult),
 {
+    let options = with_sticky_cancellation(options);
     let statements = match collect_statements(script) {
         Ok(statements) => statements,
         Err(error) => {
@@ -223,6 +333,32 @@ where
     };
 
     for (statement_index, sql) in statements.iter().enumerate() {
+        // Cooperative cancellation between statements (e.g. a server POST /cancel):
+        // don't start a new statement once cancel is requested. Mid-statement
+        // cancellation is the executor's job (Database::query honors should_cancel).
+        // Mirrors the C++ run_script between-statement check.
+        let cancellation_error = match poll_cancellation(&options.should_cancel) {
+            Ok(false) => None,
+            Ok(true) => Some("query cancelled"),
+            Err(message) => Some(message),
+        };
+        if let Some(error) = cancellation_error {
+            output.success = false;
+            output.first_error_index = Some(statement_index);
+            output.results.push(StatementResult {
+                statement_index,
+                success: false,
+                error: Some(error.to_string()),
+                sql: if options.include_sql {
+                    sql.clone()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            });
+            break;
+        }
+
         let mut result = StatementResult {
             statement_index,
             ..Default::default()
@@ -282,6 +418,17 @@ pub fn script_result_to_text(result: &ScriptResult) -> String {
             out.push_str(statement.error.as_deref().unwrap_or_default());
             out.push('\n');
         }
+        // Surface the timeout / partial-result signalling — emitted ONLY when set,
+        // so a normal result is byte-identical. `--`-prefixed to match the
+        // `-- statement` convention. Mirrors the C++ reference.
+        for warning in &statement.warnings {
+            out.push_str(&format!("-- warning: {warning}\n"));
+        }
+        if statement.timed_out {
+            out.push_str("-- query timed out; results are partial\n");
+        } else if statement.partial {
+            out.push_str("-- results are partial\n");
+        }
         if pos + 1 < result.results.len() {
             out.push('\n');
         }
@@ -304,6 +451,477 @@ pub fn script_result_to_csv(result: &ScriptResult) -> String {
 /// `script_result_to_tsv`.
 pub fn script_result_to_tsv(result: &ScriptResult) -> String {
     script_result_to_delimited(result, '\t', false)
+}
+
+/// Render a script result as JSON Lines / NDJSON: one self-describing JSON object
+/// per row, one per line — keyed by **column name** (the "records" shape a bulk
+/// consumer wants, e.g. a symbol cache). Cell values are emitted as JSON strings
+/// (SQL NULL => `null`), matching the canonical envelope's cell treatment
+/// ([`script_result_to_json`]) so a numeric column like `rva` is `"4096"` exactly
+/// as it is there. A failed statement emits one
+/// `{"statement_index":I,"error":"…"}` line instead of rows; a parse error emits
+/// `{"error":"…"}`; a column-less statement (a successful write) emits nothing. No
+/// enclosing array/envelope, so the output streams and appends cleanly. Mirrors the
+/// C++ reference's `script_result_to_jsonl`. Requires the `serde` feature.
+#[cfg(any(feature = "serde", feature = "thinclient"))]
+pub fn script_result_to_jsonl(result: &ScriptResult) -> String {
+    use serde_json::{Map, Value, json};
+    use std::collections::HashSet;
+
+    // Serialize one JSON object followed by a newline. `serde_json` never fails on a
+    // plain object of strings/nulls, so the fallback is unreachable in practice.
+    let push_line = |out: &mut String, value: &Value| {
+        out.push_str(&serde_json::to_string(value).unwrap_or_default());
+        out.push('\n');
+    };
+
+    let mut out = String::new();
+    if !result.parse_error.is_empty() {
+        push_line(&mut out, &json!({ "error": result.parse_error }));
+        return out;
+    }
+    for statement in &result.results {
+        if !statement.success {
+            push_line(
+                &mut out,
+                &json!({
+                    "statement_index": statement.statement_index,
+                    "error": statement.error.as_deref().unwrap_or_default(),
+                }),
+            );
+            continue;
+        }
+        let mut used = HashSet::new();
+        let keys = statement
+            .columns
+            .iter()
+            .map(|column| {
+                let mut candidate = column.clone();
+                let mut suffix = 2usize;
+                while used.contains(&candidate) {
+                    candidate = format!("{column}#{suffix}");
+                    suffix = suffix.saturating_add(1);
+                }
+                used.insert(candidate.clone());
+                candidate
+            })
+            .collect::<Vec<_>>();
+        for row in &statement.rows {
+            // Keyed by column name in column order (preserve_order keeps insertion
+            // order). A cell with no matching column, or a SQL NULL, becomes `null`.
+            let mut object = Map::new();
+            for (col, column) in keys.iter().enumerate() {
+                let cell = match row.get(col) {
+                    Some(Some(value)) => Value::String(value.clone()),
+                    _ => Value::Null,
+                };
+                object.insert(column.clone(), cell);
+            }
+            push_line(&mut out, &Value::Object(object));
+        }
+        if statement.timed_out || statement.partial || !statement.warnings.is_empty() {
+            let mut metadata = Map::new();
+            metadata.insert(
+                "statement_index".to_string(),
+                json!(statement.statement_index),
+            );
+            if statement.timed_out {
+                metadata.insert("timed_out".to_string(), Value::Bool(true));
+            }
+            if statement.partial {
+                metadata.insert("partial".to_string(), Value::Bool(true));
+            }
+            if !statement.warnings.is_empty() {
+                metadata.insert("warnings".to_string(), json!(statement.warnings));
+            }
+            push_line(&mut out, &Value::Object(metadata));
+        }
+    }
+    out
+}
+
+/// Execute a script and stream the canonical JSON envelope incrementally.
+///
+/// At most one read-only result row is resident in the adapter. Mutation
+/// `RETURNING` rows are buffered until the statement succeeds so rolled-back
+/// provisional rows never reach `sink`. The sink receives small valid JSON
+/// fragments; returning `false` stops query execution and suppresses all later
+/// writes (for example after an HTTP disconnect). The returned [`ScriptResult`]
+/// contains statement metadata but no buffered rows.
+#[cfg(any(feature = "serde", feature = "thinclient"))]
+pub fn stream_database_script_json<F>(
+    db: &mut Database,
+    script: &str,
+    options: ScriptOptions,
+    mut sink: F,
+) -> ScriptResult
+where
+    F: FnMut(&str) -> bool,
+{
+    use serde_json::{Value, json};
+    let options = with_sticky_cancellation(options);
+
+    let statements = match collect_statements(script) {
+        Ok(statements) => statements,
+        Err(error) => {
+            let result = ScriptResult {
+                success: false,
+                parse_error: error.to_string(),
+                ..ScriptResult::default()
+            };
+            if let Ok(encoded) = script_result_to_json(&result) {
+                let _ = sink(&encoded);
+            }
+            return result;
+        }
+    };
+    let active = std::cell::Cell::new(true);
+    let mut write = |chunk: &str| {
+        if active.get() && !sink(chunk) {
+            active.set(false);
+        }
+        active.get()
+    };
+    let mut output = ScriptResult {
+        success: true,
+        statement_count: statements.len(),
+        results: Vec::with_capacity(statements.len()),
+        ..ScriptResult::default()
+    };
+    write("{\"results\":[");
+
+    for (statement_index, sql) in statements.iter().enumerate() {
+        if !active.get() {
+            break;
+        }
+        if !output.results.is_empty() {
+            write(",");
+        }
+        let cancellation_error = match poll_cancellation(&options.should_cancel) {
+            Ok(false) => None,
+            Ok(true) => Some("query cancelled"),
+            Err(message) => Some(message),
+        };
+        if let Some(error) = cancellation_error {
+            let statement = StatementResult {
+                statement_index,
+                success: false,
+                error: Some(error.to_string()),
+                sql: if options.include_sql {
+                    sql.clone()
+                } else {
+                    String::new()
+                },
+                ..StatementResult::default()
+            };
+            let mut object = serde_json::Map::new();
+            object.insert("statement_index".into(), json!(statement_index));
+            object.insert("success".into(), Value::Bool(false));
+            if options.include_sql {
+                object.insert("sql".into(), Value::String(sql.clone()));
+            }
+            object.insert("columns".into(), json!([]));
+            object.insert("rows".into(), json!([]));
+            object.insert("row_count".into(), json!(0));
+            object.insert("elapsed_ms".into(), json!(0));
+            object.insert("error".into(), Value::String(error.to_string()));
+            write(&Value::Object(object).to_string());
+            output.success = false;
+            output.first_error_index = Some(statement_index);
+            output.results.push(statement);
+            break;
+        }
+
+        let mut opened = false;
+        let mut first_row = true;
+        let mut row_count = 0usize;
+        let query_options = crate::database::QueryOptions {
+            timeout_ms: options.timeout_ms,
+            should_cancel: options.should_cancel.clone(),
+            ..crate::database::QueryOptions::default()
+        };
+        let outcome = db.stream_query_with_options(sql, query_options, |columns, row| {
+            if !opened {
+                write("{\"statement_index\":");
+                write(&statement_index.to_string());
+                if options.include_sql {
+                    write(",\"sql\":");
+                    write(&Value::String(sql.clone()).to_string());
+                }
+                write(",\"columns\":");
+                write(&serde_json::to_string(columns).unwrap_or_else(|_| "[]".into()));
+                write(",\"rows\":[");
+                opened = true;
+            }
+            if !first_row {
+                write(",");
+            }
+            first_row = false;
+            row_count += 1;
+            let cells = row
+                .values
+                .iter()
+                .zip(&row.nulls)
+                .map(|(value, is_null)| {
+                    if *is_null {
+                        Value::Null
+                    } else {
+                        Value::String(value.clone())
+                    }
+                })
+                .collect::<Vec<_>>();
+            write(&Value::Array(cells).to_string())
+        });
+        if !active.get() {
+            break;
+        }
+        if !opened {
+            write("{\"statement_index\":");
+            write(&statement_index.to_string());
+            if options.include_sql {
+                write(",\"sql\":");
+                write(&Value::String(sql.clone()).to_string());
+            }
+            write(",\"columns\":");
+            write(&serde_json::to_string(&outcome.result.columns).unwrap_or_else(|_| "[]".into()));
+            write(",\"rows\":[");
+        }
+        write("],\"row_count\":");
+        write(&row_count.to_string());
+        write(",\"elapsed_ms\":");
+        write(&outcome.elapsed_ms.to_string());
+        write(",\"error\":");
+        write(&outcome.error.as_ref().map_or_else(
+            || "null".to_string(),
+            |error| Value::String(error.clone()).to_string(),
+        ));
+        write(",\"success\":");
+        write(if outcome.error.is_none() {
+            "true"
+        } else {
+            "false"
+        });
+        if outcome.timed_out {
+            write(",\"timed_out\":true");
+        }
+        if outcome.partial {
+            write(",\"partial\":true");
+        }
+        if !outcome.warnings.is_empty() {
+            write(",\"warnings\":");
+            write(&serde_json::to_string(&outcome.warnings).unwrap_or_else(|_| "[]".into()));
+        }
+        write("}");
+
+        let success = outcome.error.is_none();
+        let statement = StatementResult {
+            statement_index,
+            success,
+            columns: outcome.result.columns,
+            rows: Vec::new(),
+            row_count,
+            elapsed_ms: outcome.elapsed_ms as f64,
+            error: outcome.error,
+            sql: if options.include_sql {
+                sql.clone()
+            } else {
+                String::new()
+            },
+            timed_out: outcome.timed_out,
+            partial: outcome.partial,
+            warnings: outcome.warnings,
+        };
+        if !success {
+            output.success = false;
+            output.first_error_index.get_or_insert(statement_index);
+        }
+        output.row_count_total += row_count;
+        output.elapsed_ms_total += statement.elapsed_ms;
+        output.results.push(statement);
+        if !success && !options.continue_on_error {
+            break;
+        }
+    }
+
+    if active.get() {
+        write("],\"success\":");
+        write(if output.success { "true" } else { "false" });
+        write(",\"statement_count\":");
+        write(&output.statement_count.to_string());
+        write(",\"row_count_total\":");
+        write(&output.row_count_total.to_string());
+        write(",\"elapsed_ms_total\":");
+        write(&elapsed_ms_json(output.elapsed_ms_total).to_string());
+        write(",\"first_error_index\":");
+        write(
+            &output
+                .first_error_index
+                .map_or_else(|| "null".to_string(), |index| index.to_string()),
+        );
+        write("}");
+    }
+    output
+}
+
+/// Execute a script and stream JSON Lines / NDJSON one result row at a time.
+///
+/// Failed statements and timeout/partial metadata use the same line shapes as
+/// [`script_result_to_jsonl`]. Read-only rows are not retained; mutation
+/// `RETURNING` rows are held only until successful statement completion.
+#[cfg(any(feature = "serde", feature = "thinclient"))]
+pub fn stream_database_script_ndjson<F>(
+    db: &mut Database,
+    script: &str,
+    options: ScriptOptions,
+    mut sink: F,
+) -> ScriptResult
+where
+    F: FnMut(&str) -> bool,
+{
+    use serde_json::{Map, Value, json};
+    use std::collections::HashSet;
+    let options = with_sticky_cancellation(options);
+
+    let statements = match collect_statements(script) {
+        Ok(statements) => statements,
+        Err(error) => {
+            let parse_error = error.to_string();
+            let _ = sink(&format!("{}\n", json!({ "error": parse_error })));
+            return ScriptResult {
+                success: false,
+                parse_error,
+                ..ScriptResult::default()
+            };
+        }
+    };
+    let mut output = ScriptResult {
+        success: true,
+        statement_count: statements.len(),
+        results: Vec::with_capacity(statements.len()),
+        ..ScriptResult::default()
+    };
+    let mut active = true;
+
+    for (statement_index, sql) in statements.iter().enumerate() {
+        if !active {
+            break;
+        }
+        let cancellation_error = match poll_cancellation(&options.should_cancel) {
+            Ok(false) => None,
+            Ok(true) => Some("query cancelled"),
+            Err(message) => Some(message),
+        };
+        if let Some(error) = cancellation_error {
+            let _ = sink(&format!(
+                "{}\n",
+                json!({"statement_index": statement_index, "error": error})
+            ));
+            output.success = false;
+            output.first_error_index = Some(statement_index);
+            output.results.push(StatementResult {
+                statement_index,
+                success: false,
+                error: Some(error.to_string()),
+                sql: if options.include_sql {
+                    sql.clone()
+                } else {
+                    String::new()
+                },
+                ..StatementResult::default()
+            });
+            break;
+        }
+
+        let mut keys: Option<Vec<String>> = None;
+        let mut row_count = 0usize;
+        let query_options = crate::database::QueryOptions {
+            timeout_ms: options.timeout_ms,
+            should_cancel: options.should_cancel.clone(),
+            ..crate::database::QueryOptions::default()
+        };
+        let outcome = db.stream_query_with_options(sql, query_options, |columns, row| {
+            let keys = keys.get_or_insert_with(|| {
+                let mut used = HashSet::new();
+                columns
+                    .iter()
+                    .map(|column| {
+                        let mut candidate = column.clone();
+                        let mut suffix = 2usize;
+                        while used.contains(&candidate) {
+                            candidate = format!("{column}#{suffix}");
+                            suffix += 1;
+                        }
+                        used.insert(candidate.clone());
+                        candidate
+                    })
+                    .collect()
+            });
+            let mut object = Map::new();
+            for (index, key) in keys.iter().enumerate() {
+                let value = if row.nulls.get(index).copied().unwrap_or(true) {
+                    Value::Null
+                } else {
+                    Value::String(row.values.get(index).cloned().unwrap_or_default())
+                };
+                object.insert(key.clone(), value);
+            }
+            row_count += 1;
+            active = sink(&format!("{}\n", Value::Object(object)));
+            active
+        });
+        if !active {
+            break;
+        }
+        let success = outcome.error.is_none();
+        if let Some(error) = outcome.error.as_ref() {
+            active = sink(&format!(
+                "{}\n",
+                json!({"statement_index": statement_index, "error": error})
+            ));
+        } else if outcome.timed_out || outcome.partial || !outcome.warnings.is_empty() {
+            let mut metadata = Map::new();
+            metadata.insert("statement_index".into(), json!(statement_index));
+            if outcome.timed_out {
+                metadata.insert("timed_out".into(), Value::Bool(true));
+            }
+            if outcome.partial {
+                metadata.insert("partial".into(), Value::Bool(true));
+            }
+            if !outcome.warnings.is_empty() {
+                metadata.insert("warnings".into(), json!(outcome.warnings));
+            }
+            active = sink(&format!("{}\n", Value::Object(metadata)));
+        }
+
+        let statement = StatementResult {
+            statement_index,
+            success,
+            columns: outcome.result.columns,
+            rows: Vec::new(),
+            row_count,
+            elapsed_ms: outcome.elapsed_ms as f64,
+            error: outcome.error,
+            sql: if options.include_sql {
+                sql.clone()
+            } else {
+                String::new()
+            },
+            timed_out: outcome.timed_out,
+            partial: outcome.partial,
+            warnings: outcome.warnings,
+        };
+        if !success {
+            output.success = false;
+            output.first_error_index.get_or_insert(statement_index);
+        }
+        output.row_count_total += row_count;
+        output.elapsed_ms_total += statement.elapsed_ms;
+        output.results.push(statement);
+        if !active || (!success && !options.continue_on_error) {
+            break;
+        }
+    }
+    output
 }
 
 fn script_result_to_delimited(result: &ScriptResult, delim: char, csv: bool) -> String {
@@ -335,6 +953,9 @@ fn script_result_to_delimited(result: &ScriptResult, delim: char, csv: bool) -> 
 }
 
 fn render_statement_delimited(statement: &StatementResult, delim: char, csv: bool) -> String {
+    if statement.columns.is_empty() {
+        return "(no result)\n".to_string();
+    }
     let mut out = String::new();
     for (index, column) in statement.columns.iter().enumerate() {
         if index > 0 {
@@ -453,6 +1074,15 @@ pub fn script_result_to_json_with_sql(result: &ScriptResult, include_sql: bool) 
                 elapsed_ms_json(statement.elapsed_ms),
             );
             object.insert("error".to_string(), json!(statement.error));
+            if statement.timed_out {
+                object.insert("timed_out".to_string(), serde_json::Value::Bool(true));
+            }
+            if statement.partial {
+                object.insert("partial".to_string(), serde_json::Value::Bool(true));
+            }
+            if !statement.warnings.is_empty() {
+                object.insert("warnings".to_string(), json!(statement.warnings));
+            }
             serde_json::Value::Object(object)
         })
         .collect::<Vec<_>>();
@@ -603,6 +1233,25 @@ fn json_to_statement_result(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        timed_out: object
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        partial: object
+            .get("partial")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        warnings: object
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .map(|warnings| {
+                warnings
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -626,10 +1275,6 @@ impl From<serde_json::Error> for Error {
 }
 
 fn render_statement_table(statement: &StatementResult) -> String {
-    if statement.columns.is_empty() {
-        return "(no result)\n".to_string();
-    }
-
     let rendered_rows = statement
         .rows
         .iter()
@@ -639,85 +1284,15 @@ fn render_statement_table(statement: &StatementResult) -> String {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let mut widths = statement
-        .columns
-        .iter()
-        .map(String::len)
-        .collect::<Vec<_>>();
-    for row in &rendered_rows {
-        for (index, value) in row.iter().enumerate().take(widths.len()) {
-            widths[index] = widths[index].max(value.len());
-        }
-    }
-
-    let mut out = String::new();
-    write_table_row(&mut out, &statement.columns, &widths);
-    let separator = widths
-        .iter()
-        .map(|width| "-".repeat(*width))
-        .collect::<Vec<_>>();
-    write_table_row(&mut out, &separator, &widths);
-    for row in &rendered_rows {
-        write_table_row(&mut out, row, &widths);
-    }
-    out
-}
-
-fn write_table_row(out: &mut String, cells: &[String], widths: &[usize]) {
-    for (index, cell) in cells.iter().enumerate() {
-        if index > 0 {
-            out.push_str("  ");
-        }
-        out.push_str(cell);
-        if index + 1 < cells.len() {
-            let width = widths.get(index).copied().unwrap_or(cell.len());
-            if cell.len() < width {
-                out.push_str(&" ".repeat(width - cell.len()));
-            }
-        }
-    }
-    out.push('\n');
-}
-
-fn run_one_statement(db: &mut Database, sql: &str) -> Result<StatementResult> {
-    let mut statement = db.prepare(sql)?;
-    let column_count = statement.column_count();
-    let mut result = StatementResult {
-        columns: Vec::new(),
-        rows: Vec::new(),
-        ..Default::default()
-    };
-
-    if column_count > 0 {
-        for col in 0..column_count {
-            result.columns.push(statement.column_name(col));
-        }
-    }
-
-    loop {
-        match statement.step() {
-            StepResult::Row => {
-                let mut row = Vec::with_capacity(column_count as usize);
-                for col in 0..column_count {
-                    row.push(if statement.column_is_null(col) {
-                        None
-                    } else {
-                        Some(statement.text(col))
-                    });
-                }
-                result.rows.push(row);
-            }
-            StepResult::Done => return Ok(result),
-            StepResult::Busy | StepResult::Error => {
-                let message = if statement.error().is_empty() {
-                    db.last_error().to_string()
-                } else {
-                    statement.error().to_string()
-                };
-                return Err(Error::Message(message));
-            }
-        }
-    }
+    // Match the C++ core: render_statement_table calls print_table with default
+    // options (newline_after_no_result = false), so an empty result renders
+    // "(no result)" with no trailing newline. The surrounding join logic (header
+    // line + inter-statement blank line) is identical on both sides.
+    table_printer::print_table(
+        &statement.columns,
+        &rendered_rows,
+        TablePrintOptions::default(),
+    )
 }
 
 fn sqlite_complete(sql: &str) -> Result<bool> {

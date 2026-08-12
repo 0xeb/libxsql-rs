@@ -1,8 +1,8 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 use crate::{Error, Result, ScriptOptions, ScriptResult, StatementResult};
 use serde_json::Value;
@@ -121,19 +121,26 @@ pub(crate) fn bind_address_port(bind_address: &str, port: u16) -> Result<TcpList
     }
     let start = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.subsec_nanos() as u16 % 100)
+        .map(|duration| duration.subsec_nanos() as u16 % 900)
         .unwrap_or(0);
     let mut last_error = None;
-    for offset in 0..100 {
-        let port = 8100 + ((start + offset) % 100);
+    for offset in 0..900 {
+        let port = 8100 + ((start + offset) % 900);
         match TcpListener::bind((bind_address, port)) {
             Ok(listener) => return Ok(listener),
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error
-        .map(io_error)
-        .unwrap_or_else(|| Error::Message("no port available in 8100-8199".to_string())))
+    // Keep binding atomic even when the preferred range is exhausted: ask the
+    // OS for an ephemeral port and return that still-open listener.
+    TcpListener::bind((bind_address, 0)).map_err(|fallback| {
+        let preferred = last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no port available in 8100-8999".to_string());
+        Error::Message(format!(
+            "{preferred}; ephemeral-port fallback failed: {fallback}"
+        ))
+    })
 }
 
 pub(crate) fn ensure_secure_bind(
@@ -158,4 +165,51 @@ fn is_loopback_bind_address(addr: &str) -> bool {
 
 pub(crate) fn io_error(error: std::io::Error) -> Error {
     Error::Message(error.to_string())
+}
+
+/// Constant-time bearer-token comparison shared by every thinclient server,
+/// mirroring the C++ `xsql::thinclient::detail::timing_safe_equal`.
+///
+/// `str`/`String` equality short-circuits on the first differing byte, which
+/// turns an authenticated endpoint into a remote timing oracle for the secret's
+/// matching prefix. This accumulates differences over the presented token's full
+/// length instead. The secret's LENGTH is not concealed (a length mismatch is
+/// unequal), only prefix-match timing.
+pub(crate) fn timing_safe_equal(presented: &str, expected: &str) -> bool {
+    let presented = presented.as_bytes();
+    let expected = expected.as_bytes();
+    let mut acc: u8 = if presented.len() == expected.len() {
+        0
+    } else {
+        1
+    };
+    for (i, &p) in presented.iter().enumerate() {
+        let e = if expected.is_empty() {
+            0
+        } else {
+            expected[i % expected.len()]
+        };
+        acc |= p ^ e;
+    }
+    acc == 0
+}
+
+#[cfg(test)]
+mod auth_compare_tests {
+    use super::timing_safe_equal;
+
+    #[test]
+    fn timing_safe_equal_matches_only_on_exact_secret() {
+        assert!(timing_safe_equal("s3cret", "s3cret"));
+        // Same length, wrong content.
+        assert!(!timing_safe_equal("s3creX", "s3cret"));
+        // Correct prefix, wrong suffix (the timing-oracle case).
+        assert!(!timing_safe_equal("s3cre", "s3cret"));
+        // Longer than the secret.
+        assert!(!timing_safe_equal("s3cretary", "s3cret"));
+        // Empty presented vs non-empty secret.
+        assert!(!timing_safe_equal("", "s3cret"));
+        // Empty vs empty is equal (mirrors operator== on two empty strings).
+        assert!(timing_safe_equal("", ""));
+    }
 }

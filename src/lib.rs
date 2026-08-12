@@ -1,11 +1,10 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
-//! Rust port of libxsql: safe, typed builders for exposing Rust data through
-//! SQLite virtual tables.
+//! Safe, typed Rust builders for exposing data through SQLite virtual tables.
 //!
 //! The crate is intentionally built around direct SQLite FFI because virtual
 //! table parity needs access to planner (`xBestIndex`) and update (`xUpdate`)
@@ -24,8 +23,9 @@
 //!     required/optional constraints, and sort elision.
 //! - Scalar and aggregate SQL functions (including the built-in `blob_concat`).
 //! - Prepared [`Statement`]s, script splitting/execution, SQL [`export_tables`],
-//!   query timeouts with partial results, and cooperative cancellation via
-//!   [`vtab_interrupted`].
+//!   preparation-inclusive query timeouts, sticky cooperative cancellation,
+//!   partial results for read-only statements, and rollback-safe mutation
+//!   interruption via [`vtab_interrupted`].
 //!
 //! # Feature flags
 //!
@@ -60,19 +60,29 @@
 #![deny(missing_docs)]
 
 mod aggregate;
+mod capabilities;
 mod database;
 mod error;
 mod function;
 mod statement;
+/// Shared borderless and boxed table rendering for command-line consumers.
+pub mod table_printer;
 mod value;
 
 /// SQL export helpers: serialize tables to a SQL `CREATE`/`INSERT` script.
 pub mod export;
+/// General-purpose directed-graph algorithms (RE-agnostic): dominators,
+/// post-dominators, natural loops, strongly connected components, and topological
+/// order over opaque integer node ids. Port of the C++ `xsql::graph` header.
+pub mod graph;
+/// Shared runtime settings and the common `PRAGMA <prefix>.*` handler
+/// (query/queue timeouts, admission queue bound, hints toggle, timeout stack).
+pub mod runtime_settings;
 /// SQL script splitting, execution, and canonical result formatting
 /// (text/CSV/TSV, plus JSON with the `serde` or `thinclient` feature).
 pub mod script;
 /// Blocking HTTP query server and client (the `thinclient` feature): query
-/// endpoint, status/shutdown routes, auth, queue mode, CLI parsing, and
+/// endpoint, status/cancel/shutdown routes, auth, queue mode, CLI parsing, and
 /// clipboard helpers.
 #[cfg(feature = "thinclient")]
 pub mod thinclient;
@@ -90,6 +100,7 @@ pub type Json = serde_json::Value;
 pub type OrderedJson = serde_json::Value;
 
 pub use aggregate::AggregateContext;
+pub use capabilities::{SqlCapability, define_sql_capabilities};
 pub use database::{Database, QueryOptions, QueryOutcome, QueryResult, Row, ScriptExecutionMode};
 pub use error::{
     Error, Result, Status, is_done, is_ok, is_ok_sqlite, is_ok_status, is_row, to_sqlite_status,
@@ -103,13 +114,18 @@ pub use script::{
     script_result_to_csv, script_result_to_text, script_result_to_tsv, split_script,
 };
 #[cfg(any(feature = "serde", feature = "thinclient"))]
-pub use script::{json_to_script_result, script_result_to_json, script_result_to_json_with_sql};
+pub use script::{
+    json_to_script_result, script_result_to_json, script_result_to_json_with_sql,
+    script_result_to_jsonl, stream_database_script_json, stream_database_script_ndjson,
+};
 pub use statement::{Statement, StepResult};
+pub use table_printer::{TablePrintOptions, TableStyle, print_table};
 pub use value::{OwnedValue, ValueRef, ValueType};
 pub use vtab::{
     CachedTableBuilder, CachedTableDef, ColumnType, ConstraintOp, ConstraintRequest, Generator,
     GeneratorConstraintArg, GeneratorTableBuilder, GeneratorTableDef, RowIterator, TableBuilder,
-    TableDef, cached_table, clear_vtab_interrupt_checker, generator_table, optional_eq,
-    optional_ge, optional_gt, optional_le, optional_like, optional_lt, required_eq, required_like,
-    set_vtab_interrupt_checker, table, vtab_interrupted,
+    TableDef, TransactionHooks, TransactionState, cached_table, clear_vtab_interrupt_checker,
+    generator_table, optional_eq, optional_ge, optional_gt, optional_le, optional_like,
+    optional_lt, required_eq, required_like, set_vtab_error, set_vtab_interrupt_checker, table,
+    vtab_interrupted,
 };

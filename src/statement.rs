@@ -1,12 +1,14 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 use crate::error::{Error, Result, Status, sqlite_ok};
 use crate::function::sqlite_error;
+use crate::vtab::WriteSurfaceRegistry;
 use libsqlite3_sys as ffi;
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::rc::Rc;
@@ -14,11 +16,21 @@ use std::slice;
 
 pub(crate) struct ConnectionInner {
     db: *mut ffi::sqlite3,
+    // Per-connection write-surface registry read live by the prepare-time
+    // authorizer (installed in `open_connection`). Behind a `Box` so its address
+    // is pinned for the authorizer's `pArg` even if this struct is moved before
+    // being placed in the `Rc`. Dropped with the connection, after `sqlite3_close`
+    // has removed the authorizer.
+    registry: Box<RefCell<WriteSurfaceRegistry>>,
 }
 
 impl ConnectionInner {
     pub(crate) fn raw(&self) -> *mut ffi::sqlite3 {
         self.db
+    }
+
+    pub(crate) fn write_surface_registry(&self) -> *const RefCell<WriteSurfaceRegistry> {
+        &*self.registry
     }
 }
 
@@ -57,6 +69,9 @@ impl Statement {
     pub(crate) fn prepare(inner: Rc<ConnectionInner>, sql: &str) -> Result<Self> {
         let sql = CString::new(sql)?;
         let mut stmt = std::ptr::null_mut();
+        // Clear any prior denial so the message reflects only THIS prepare; the
+        // write-surface authorizer sets it during prepare_v2 on a denied write.
+        crate::vtab::clear_authorizer_denial();
         let rc = unsafe {
             ffi::sqlite3_prepare_v2(
                 inner.raw(),
@@ -67,7 +82,17 @@ impl Statement {
             )
         };
         if !sqlite_ok(rc) {
-            let message = sqlite_error(inner.raw());
+            // On an authorizer denial SQLite reports a fixed "not authorized";
+            // substitute the capability-scoped message the authorizer stashed so
+            // the caller sees WHY the write was refused (byte-identical to the
+            // matched-row path). Mirrors the C++/C ports.
+            let message = if rc == ffi::SQLITE_AUTH
+                && let Some(denial) = crate::vtab::take_authorizer_denial()
+            {
+                denial
+            } else {
+                sqlite_error(inner.raw())
+            };
             if !stmt.is_null() {
                 unsafe { ffi::sqlite3_finalize(stmt) };
             }
@@ -366,5 +391,14 @@ pub(crate) fn open_connection(path: &str) -> Result<Rc<ConnectionInner>> {
         }
         return Err(Error::sqlite(rc, message));
     }
-    Ok(Rc::new(ConnectionInner { db }))
+    // Install the write-surface authorizer. It reads the registry live at prepare
+    // time (populated as tables are registered/created), so a write to an
+    // unsupported surface is denied at prepare -- including the 0-row case that
+    // never reaches xUpdate. The registry is pinned behind a `Box` so its address
+    // stays valid for the authorizer's `pArg` for the connection's lifetime.
+    let registry: Box<RefCell<WriteSurfaceRegistry>> = Box::default();
+    unsafe {
+        crate::vtab::install_authorizer(db, &*registry as *const RefCell<WriteSurfaceRegistry>);
+    }
+    Ok(Rc::new(ConnectionInner { db, registry }))
 }

@@ -1,8 +1,8 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 use crate::aggregate::AggregateContext;
 use crate::error::{Error, Result, sqlite_ok};
@@ -12,18 +12,31 @@ use crate::statement::{ConnectionInner, Statement, StepResult, open_connection};
 use crate::value::ValueType;
 use crate::vtab::{CachedTableDef, GeneratorTableDef, TableDef};
 use libsqlite3_sys as ffi;
-use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
+
+static NEXT_QUERY_SAVEPOINT: AtomicU64 = AtomicU64::new(1);
 
 /// One SQLite result row represented as display-ready cell strings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Row {
     /// Display-ready cell strings, one per result column.
     pub values: Vec<String>,
+    /// Per-cell SQL-NULL flags, parallel to `values` (`true` => the cell was SQL
+    /// NULL; its `values` entry is then an empty placeholder). May be empty for
+    /// rows built without null tracking, in which case [`Row::is_null`] returns
+    /// `false`. Lets a genuine text value (even "" or "NULL") stay distinct from a
+    /// real SQL NULL — mirroring the C++ `xsql::Row` null bitmap.
+    pub nulls: Vec<bool>,
 }
 
 impl Row {
@@ -35,6 +48,11 @@ impl Row {
     /// Returns `true` if the row has no cells.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+
+    /// Returns `true` if cell `i` was a SQL NULL (vs a genuine text value).
+    pub fn is_null(&self, i: usize) -> bool {
+        self.nulls.get(i).copied().unwrap_or(false)
     }
 }
 
@@ -90,12 +108,37 @@ impl<'a> IntoIterator for &'a QueryResult {
 }
 
 /// Deadline and polling controls for `query_with_options`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Carries an optional [`should_cancel`](QueryOptions::should_cancel) closure, so
+/// unlike the other option structs it is [`Clone`] but not `Copy`/`PartialEq`.
+#[derive(Clone, Default)]
 pub struct QueryOptions {
     /// Query deadline in milliseconds; `0` disables the timeout.
     pub timeout_ms: u64,
     /// SQLite VM steps between timeout checks; values `<= 0` default to 1000.
     pub progress_steps: i32,
+    /// Optional cooperative cancellation predicate (see
+    /// [`ScriptOptions::should_cancel`](crate::script::ScriptOptions::should_cancel)).
+    /// When set and it returns `true`, the query stops ASAP. A read-only row
+    /// query keeps rows gathered so far (`partial` + a "query cancelled"
+    /// warning, but **not** `timed_out`). A mutation, including one with a
+    /// `RETURNING` clause, reports a hard "Query cancelled" error and rolls back
+    /// the incomplete statement. Works even when `timeout_ms == 0`, so a server
+    /// can bound an otherwise-unlimited query. `None` => never cancelled.
+    pub should_cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl std::fmt::Debug for QueryOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryOptions")
+            .field("timeout_ms", &self.timeout_ms)
+            .field("progress_steps", &self.progress_steps)
+            .field(
+                "should_cancel",
+                &self.should_cancel.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
 }
 
 /// Query result plus timeout, warning, and error metadata.
@@ -103,17 +146,21 @@ pub struct QueryOptions {
 pub struct QueryOutcome {
     /// The rows and columns gathered before the query finished or stopped.
     pub result: QueryResult,
-    /// Error message if the query failed; `None` on success or partial timeout.
+    /// Error message if the query failed; `None` on success or a read-only
+    /// partial timeout/cancellation.
     pub error: Option<String>,
     /// Non-fatal warnings, such as the partial-rows timeout notice.
     pub warnings: Vec<String>,
     /// `true` if the query hit its deadline.
     pub timed_out: bool,
-    /// `true` if a row-producing query timed out and `result` holds partial rows.
+    /// `true` if a read-only row query stopped after producing rows (or columns)
+    /// and `result` holds the partial result.
     pub partial: bool,
     /// Wall-clock time spent executing the query, in milliseconds.
     pub elapsed_ms: u64,
 }
+
+type RowSink<'a> = dyn FnMut(&[String], &Row) -> bool + 'a;
 
 impl QueryOutcome {
     /// Returns `true` if the query produced no error.
@@ -149,7 +196,6 @@ pub enum ScriptExecutionMode {
 pub struct Database {
     inner: Option<Rc<ConnectionInner>>,
     last_error: String,
-    interrupted: Rc<Cell<bool>>,
 }
 
 impl Database {
@@ -164,7 +210,6 @@ impl Database {
         let mut db = Self {
             inner: Some(inner),
             last_error: String::new(),
-            interrupted: Rc::new(Cell::new(false)),
         };
         db.register_builtin_aggregates()?;
         Ok(db)
@@ -230,12 +275,18 @@ impl Database {
 
     /// Registers `def` as a virtual-table module named after the table.
     pub fn register_table(&mut self, def: &TableDef) -> Result<()> {
-        crate::vtab::register_index_table(self.raw()?, def.name(), def)
+        self.register_table_as(def.name(), def)
     }
 
     /// Registers `def` as a virtual-table module under `module_name`.
     pub fn register_table_as(&mut self, module_name: &str, def: &TableDef) -> Result<()> {
-        crate::vtab::register_index_table(self.raw()?, module_name, def)
+        let connection = self.connection()?;
+        crate::vtab::register_index_table(
+            connection.raw(),
+            connection.write_surface_registry(),
+            module_name,
+            def,
+        )
     }
 
     /// Creates a virtual table `table_name` backed by the module `module_name`.
@@ -273,7 +324,7 @@ impl Database {
 
     /// Registers `def` as a cached-row virtual-table module named after the table.
     pub fn register_cached_table<Row: 'static>(&mut self, def: &CachedTableDef<Row>) -> Result<()> {
-        crate::vtab::register_cached_table(self.raw()?, def.name(), def)
+        self.register_cached_table_as(def.name(), def)
     }
 
     /// Registers `def` as a cached-row virtual-table module under `module_name`.
@@ -282,7 +333,13 @@ impl Database {
         module_name: &str,
         def: &CachedTableDef<Row>,
     ) -> Result<()> {
-        crate::vtab::register_cached_table(self.raw()?, module_name, def)
+        let connection = self.connection()?;
+        crate::vtab::register_cached_table(
+            connection.raw(),
+            connection.write_surface_registry(),
+            module_name,
+            def,
+        )
     }
 
     /// Registers a cached-row `def` and creates a virtual table of the same name.
@@ -309,7 +366,7 @@ impl Database {
         &mut self,
         def: &GeneratorTableDef<Row>,
     ) -> Result<()> {
-        crate::vtab::register_generator_table(self.raw()?, def.name(), def)
+        self.register_generator_table_as(def.name(), def)
     }
 
     /// Registers `def` as a generator virtual-table module under `module_name`.
@@ -318,7 +375,13 @@ impl Database {
         module_name: &str,
         def: &GeneratorTableDef<Row>,
     ) -> Result<()> {
-        crate::vtab::register_generator_table(self.raw()?, module_name, def)
+        let connection = self.connection()?;
+        crate::vtab::register_generator_table(
+            connection.raw(),
+            connection.write_surface_registry(),
+            module_name,
+            def,
+        )
     }
 
     /// Registers a generator `def` and creates a virtual table of the same name.
@@ -355,10 +418,41 @@ impl Database {
 
     /// Runs `sql` under the given `options`, returning a [`QueryOutcome`].
     ///
-    /// When a deadline is set and reached: a row-producing query returns the
+    /// When a deadline is set and reached: a read-only row query returns the
     /// rows gathered so far with `partial`/`timed_out` set and a warning (no
-    /// error), while a query with no result columns returns a timeout error.
+    /// error), while a mutation (including `RETURNING`) reports a timeout error
+    /// and rolls back the incomplete statement.
     pub fn query_with_options(&mut self, sql: &str, options: QueryOptions) -> QueryOutcome {
+        self.query_with_options_impl(sql, options, None, true)
+    }
+
+    /// Step a query while handing each row to `sink` instead of retaining it.
+    ///
+    /// The returned outcome preserves columns, errors, timeout/cancellation
+    /// metadata, and elapsed time, but its row vector stays empty. Returning
+    /// `false` from `sink` stops stepping, which lets a transport bound memory
+    /// and stop promptly after a disconnected client. Read-only rows reach the
+    /// sink incrementally. Mutation `RETURNING` rows are buffered until the
+    /// statement succeeds so rolled-back provisional rows never reach it.
+    pub fn stream_query_with_options<F>(
+        &mut self,
+        sql: &str,
+        options: QueryOptions,
+        mut sink: F,
+    ) -> QueryOutcome
+    where
+        F: FnMut(&[String], &Row) -> bool,
+    {
+        self.query_with_options_impl(sql, options, Some(&mut sink), false)
+    }
+
+    fn query_with_options_impl(
+        &mut self,
+        sql: &str,
+        options: QueryOptions,
+        mut sink: Option<&mut RowSink<'_>>,
+        collect_rows: bool,
+    ) -> QueryOutcome {
         let mut outcome = QueryOutcome {
             result: QueryResult::default(),
             error: None,
@@ -377,81 +471,185 @@ impl Database {
             }
         };
 
+        let started = Instant::now();
+        let timeout_enabled = options.timeout_ms > 0;
+        let cancel_enabled = options.should_cancel.is_some();
+        // The progress-handler + interrupt-checker machinery is needed whenever
+        // EITHER a deadline OR a cancel predicate is in play (cancel must work under
+        // timeout_ms == 0). Mirrors the C++ `guard_enabled`.
+        let guard_enabled = timeout_enabled || cancel_enabled;
+        let cancellation = options
+            .should_cancel
+            .clone()
+            .map(CancellationState::new)
+            .map(Arc::new);
+        let mut timeout_state = Box::new(TimeoutState {
+            started,
+            timeout: Duration::from_millis(options.timeout_ms),
+            timeout_enabled,
+            timed_out: false,
+            cancellation: cancellation.clone(),
+        });
+        let progress_steps = if options.progress_steps > 0 {
+            options.progress_steps
+        } else {
+            1000
+        };
+        // Install both guards before prepare so xConnect/xBestIndex work is part
+        // of the operation deadline. The guards restore any outer libxsql query.
+        let deadline = started + timeout_state.timeout;
+        let has_deadline = timeout_enabled;
+        let checker_cancellation = cancellation.clone();
+        let _interrupt_guard = QueryInterruptGuard::install(
+            db,
+            guard_enabled,
+            progress_steps,
+            (&mut *timeout_state as *mut TimeoutState).cast(),
+            Box::new(move || {
+                (has_deadline && Instant::now() >= deadline)
+                    || checker_cancellation
+                        .as_ref()
+                        .is_some_and(|cancellation| cancellation.poll())
+            }),
+        );
+
         let mut stmt = match self.prepare(sql) {
             Ok(stmt) => stmt,
             Err(err) => {
-                let message = err.to_string();
-                self.last_error = message.clone();
-                outcome.error = Some(message);
+                if timeout_enabled && started.elapsed() >= timeout_state.timeout {
+                    timeout_state.timed_out = true;
+                }
+                if !classify_query_interrupt(&mut outcome, &timeout_state, false) {
+                    outcome.error = Some(err.to_string());
+                }
+                outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+                if let Some(error) = outcome.error.as_ref() {
+                    self.last_error.clone_from(error);
+                }
                 return outcome;
             }
         };
 
-        let started = Instant::now();
-        let timeout_enabled = options.timeout_ms > 0;
-        let mut timeout_state = TimeoutState {
-            started,
-            timeout: Duration::from_millis(options.timeout_ms),
-            timed_out: false,
-        };
-
-        if timeout_enabled {
-            let progress_steps = if options.progress_steps > 0 {
-                options.progress_steps
-            } else {
-                1000
-            };
-            unsafe {
-                ffi::sqlite3_progress_handler(
-                    db,
-                    progress_steps,
-                    Some(progress_callback),
-                    (&mut timeout_state as *mut TimeoutState).cast(),
-                );
-            }
-            let deadline = started + timeout_state.timeout;
-            crate::vtab::set_vtab_interrupt_checker(move || Instant::now() >= deadline);
-            self.interrupted.set(false);
-        }
-
         let col_count = stmt.column_count();
+        let readonly = stmt.is_readonly();
+        let partial_capable = col_count > 0 && readonly;
         for i in 0..col_count {
             outcome.result.columns.push(stmt.column_name(i));
         }
 
+        // SQLite computes all DML RETURNING changes before yielding its first
+        // row. Finalizing a statement after that row commits those changes, so a
+        // cancellation observed between RETURNING rows would otherwise report an
+        // error after committing. A private savepoint makes that early stop
+        // rollback only this statement (and preserves any caller transaction).
+        let returning_savepoint =
+            (guard_enabled && col_count > 0 && !readonly && has_sql_keyword(sql, "returning"))
+                .then(|| {
+                    format!(
+                        "__libxsql_query_{}",
+                        NEXT_QUERY_SAVEPOINT.fetch_add(1, Ordering::Relaxed)
+                    )
+                });
+        if let Some(name) = returning_savepoint.as_ref()
+            && let Err(message) = exec_internal_sql(db, &format!("SAVEPOINT \"{name}\""))
+        {
+            if timeout_enabled && started.elapsed() >= timeout_state.timeout {
+                timeout_state.timed_out = true;
+            }
+            if !classify_query_interrupt(&mut outcome, &timeout_state, false) {
+                outcome.error = Some(message);
+            }
+            outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+            if let Some(error) = outcome.error.as_ref() {
+                self.last_error.clone_from(error);
+            }
+            return outcome;
+        }
+
+        // A mutation with RETURNING is not safe to expose incrementally: SQLite
+        // may still roll the statement back on a later step, timeout, or
+        // cancellation. Buffer only the streaming sink's mutation rows and
+        // release them after SQLITE_DONE establishes successful completion.
+        let mut deferred_sink_rows = Vec::new();
+        let mut completed = false;
+        // Whether at least one row has been delivered to the caller (collected or
+        // streamed through the sink). The zero-row cancel/timeout error contract
+        // keys on delivery, not on `outcome.result.rows`, because the streaming
+        // script path delivers rows via the sink with `collect_rows == false`.
+        let mut delivered_row = false;
         loop {
+            // SQLite may execute a short mutation without invoking its progress
+            // callback. Poll before every step so an already-cancelled request
+            // cannot mutate first and only be noticed afterward.
+            if guard_enabled && poll_timeout_state(&mut timeout_state) {
+                let classified = classify_query_interrupt(
+                    &mut outcome,
+                    &timeout_state,
+                    partial_capable && delivered_row,
+                );
+                debug_assert!(classified);
+                break;
+            }
             match stmt.step() {
                 StepResult::Row => {
                     let mut row = Row {
                         values: Vec::with_capacity(col_count as usize),
+                        nulls: Vec::with_capacity(col_count as usize),
                     };
                     for col in 0..col_count {
-                        row.values.push(if stmt.column_is_null(col) {
+                        let is_null = stmt.column_is_null(col);
+                        row.values.push(if is_null {
                             String::new()
                         } else {
                             stmt.text(col)
                         });
+                        row.nulls.push(is_null);
                     }
-                    outcome.result.rows.push(row);
-                }
-                StepResult::Done => break,
-                StepResult::Busy | StepResult::Error => {
-                    if timeout_enabled && started.elapsed() >= timeout_state.timeout {
-                        outcome.timed_out = true;
-                        if col_count > 0 {
-                            outcome.partial = true;
-                            outcome
-                                .warnings
-                                .push("query timed out; returning partial rows".to_string());
-                        } else {
-                            outcome.error = Some("Query timed out".to_string());
-                        }
+                    if sink.is_some() && !partial_capable {
+                        deferred_sink_rows.push(row);
                     } else {
+                        delivered_row = true;
+                        if let Some(sink) = sink.as_mut()
+                            && !sink(&outcome.result.columns, &row)
+                        {
+                            break;
+                        }
+                        if collect_rows {
+                            outcome.result.rows.push(row);
+                        }
+                    }
+                }
+                StepResult::Done => {
+                    completed = true;
+                    break;
+                }
+                StepResult::Busy | StepResult::Error => {
+                    // Classify the stop by cause — cancel first (it takes precedence
+                    // and is not a timeout), then a deadline, then a genuine
+                    // statement error. The vtable checker cannot borrow the stack
+                    // timeout state, so latch its elapsed deadline only on this
+                    // non-DONE path. Never freshly poll cancellation after a step.
+                    if timeout_enabled && started.elapsed() >= timeout_state.timeout {
+                        timeout_state.timed_out = true;
+                    }
+                    if !classify_query_interrupt(
+                        &mut outcome,
+                        &timeout_state,
+                        partial_capable && delivered_row,
+                    ) {
                         let message = if stmt.error().is_empty() {
                             sqlite_error(db)
                         } else {
                             stmt.error().to_string()
                         };
+                        if partial_capable && delivered_row {
+                            outcome.partial = true;
+                            outcome
+                                .warnings
+                                .push("query failed; returning partial rows".to_string());
+                        } else {
+                            outcome.result.rows.clear();
+                        }
                         self.last_error = message.clone();
                         outcome.error = Some(message);
                     }
@@ -460,27 +658,55 @@ impl Database {
             }
         }
 
-        outcome.elapsed_ms = started.elapsed().as_millis() as u64;
-        if timeout_enabled {
-            unsafe {
-                ffi::sqlite3_progress_handler(db, 0, None, std::ptr::null_mut());
+        // Finalize the DML before ending its savepoint. On an interrupted
+        // RETURNING statement, rollback while the savepoint still scopes the
+        // mutation; on success, RELEASE commits it. Never emit deferred rows
+        // until RELEASE succeeds.
+        drop(stmt);
+        drop(_interrupt_guard);
+        if let Some(name) = returning_savepoint.as_ref() {
+            if completed && outcome.error.is_none() {
+                if let Err(message) = exec_internal_sql(db, &format!("RELEASE \"{name}\"")) {
+                    outcome.result.rows.clear();
+                    deferred_sink_rows.clear();
+                    outcome.partial = false;
+                    outcome.warnings.clear();
+                    outcome.error = Some(message);
+                    completed = false;
+                }
+            } else {
+                let rollback_error =
+                    exec_internal_sql(db, &format!("ROLLBACK TO \"{name}\"")).err();
+                let release_error = exec_internal_sql(db, &format!("RELEASE \"{name}\"")).err();
+                if let Some(message) = rollback_error.or(release_error) {
+                    let original = outcome.error.take().unwrap_or_default();
+                    outcome.error = Some(if original.is_empty() {
+                        message
+                    } else {
+                        format!("{original}; failed to roll back interrupted statement: {message}")
+                    });
+                }
             }
-            crate::vtab::clear_vtab_interrupt_checker();
         }
 
-        if timeout_enabled && timeout_state.timed_out {
-            outcome.timed_out = true;
-            if col_count > 0 {
-                outcome.partial = true;
-                if outcome.warnings.is_empty() {
-                    outcome
-                        .warnings
-                        .push("query timed out; returning partial rows".to_string());
+        if completed && outcome.error.is_none() && !deferred_sink_rows.is_empty() {
+            for row in &deferred_sink_rows {
+                if let Some(sink) = sink.as_mut()
+                    && !sink(&outcome.result.columns, row)
+                {
+                    break;
                 }
-                outcome.error = None;
-            } else if outcome.error.is_none() {
-                outcome.error = Some("Query timed out".to_string());
             }
+            if collect_rows {
+                for row in deferred_sink_rows {
+                    outcome.result.rows.push(row);
+                }
+            }
+        }
+
+        outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+        if let Some(error) = outcome.error.as_ref() {
+            self.last_error.clone_from(error);
         }
 
         outcome
@@ -532,9 +758,22 @@ impl Database {
     pub fn exec(&mut self, sql: &str) -> Result<()> {
         let db = self.raw()?;
         let sql = CString::new(sql)?;
+        // sqlite3_exec runs its own prepare internally, so clear the denial slot
+        // first and, on an authorizer denial, surface the capability-scoped
+        // message rather than SQLite's fixed "not authorized" (mirrors C++/C).
+        crate::vtab::clear_authorizer_denial();
         let mut err = std::ptr::null_mut();
         let rc =
             unsafe { ffi::sqlite3_exec(db, sql.as_ptr(), None, std::ptr::null_mut(), &mut err) };
+        if rc == ffi::SQLITE_AUTH
+            && let Some(denial) = crate::vtab::take_authorizer_denial()
+        {
+            if !err.is_null() {
+                unsafe { ffi::sqlite3_free(err.cast()) };
+            }
+            self.last_error = denial.clone();
+            return Err(Error::sqlite(rc, denial));
+        }
         if !err.is_null() {
             let message = unsafe { std::ffi::CStr::from_ptr(err) }
                 .to_string_lossy()
@@ -567,6 +806,9 @@ impl Database {
             callback: (&mut callback as *mut F).cast(),
             invoke: invoke_exec_callback::<F>,
         };
+        // See `exec`: clear the denial slot and, on a denial, surface the
+        // capability-scoped message rather than "not authorized".
+        crate::vtab::clear_authorizer_denial();
         let mut err = std::ptr::null_mut();
         let rc = unsafe {
             ffi::sqlite3_exec(
@@ -577,6 +819,15 @@ impl Database {
                 &mut err,
             )
         };
+        if rc == ffi::SQLITE_AUTH
+            && let Some(denial) = crate::vtab::take_authorizer_denial()
+        {
+            if !err.is_null() {
+                unsafe { ffi::sqlite3_free(err.cast()) };
+            }
+            self.last_error = denial.clone();
+            return Err(Error::sqlite(rc, denial));
+        }
         if !err.is_null() {
             let message = unsafe { CStr::from_ptr(err) }
                 .to_string_lossy()
@@ -718,10 +969,276 @@ impl Database {
     }
 }
 
+fn has_sql_keyword(sql: &str, keyword: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let keyword = keyword.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == quote {
+                        if bytes.get(index + 1) == Some(&quote) {
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'[' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b']' {
+                    index += 1;
+                }
+                index = index.saturating_add(1);
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && !matches!(bytes[index], b'\r' | b'\n') {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = index.saturating_add(2).min(bytes.len());
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                if bytes[start..index].eq_ignore_ascii_case(keyword) {
+                    return true;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+fn exec_internal_sql(db: *mut ffi::sqlite3, sql: &str) -> std::result::Result<(), String> {
+    let sql = CString::new(sql).map_err(|error| error.to_string())?;
+    let mut error = std::ptr::null_mut();
+    let rc = unsafe { ffi::sqlite3_exec(db, sql.as_ptr(), None, std::ptr::null_mut(), &mut error) };
+    if !error.is_null() {
+        let message = unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ffi::sqlite3_free(error.cast()) };
+        return Err(message);
+    }
+    if sqlite_ok(rc) {
+        Ok(())
+    } else {
+        Err(sqlite_error(db))
+    }
+}
+
 struct TimeoutState {
     started: Instant,
     timeout: Duration,
+    timeout_enabled: bool,
     timed_out: bool,
+    cancellation: Option<Arc<CancellationState>>,
+}
+
+struct CancellationState {
+    predicate: Arc<dyn Fn() -> bool + Send + Sync>,
+    cancelled: AtomicBool,
+    panicked: AtomicBool,
+}
+
+impl CancellationState {
+    fn new(predicate: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self {
+            predicate,
+            cancelled: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
+        }
+    }
+
+    fn poll(&self) -> bool {
+        if self.panicked() || self.cancelled() {
+            return true;
+        }
+        match catch_unwind(AssertUnwindSafe(|| (self.predicate)())) {
+            Ok(cancelled) => {
+                if cancelled {
+                    self.cancelled.store(true, Ordering::Release);
+                }
+                cancelled
+            }
+            Err(_) => {
+                self.panicked.store(true, Ordering::Release);
+                true
+            }
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn panicked(&self) -> bool {
+        self.panicked.load(Ordering::Acquire)
+    }
+}
+
+// `can_be_partial` is `partial_capable && at least one row already delivered`:
+// a read-only statement with a non-empty prefix keeps that prefix as a partial
+// result, but a zero-row cancel/timeout is a hard error (an empty "partial" would
+// read as a valid truncation of the real result). Mirrors C++ database.cpp.
+fn classify_query_interrupt(
+    outcome: &mut QueryOutcome,
+    timeout_state: &TimeoutState,
+    can_be_partial: bool,
+) -> bool {
+    if timeout_state
+        .cancellation
+        .as_ref()
+        .is_some_and(|cancellation| cancellation.panicked())
+    {
+        outcome.result.rows.clear();
+        outcome.timed_out = false;
+        outcome.partial = false;
+        outcome.warnings.clear();
+        outcome.error = Some("cancellation predicate panicked".to_string());
+        return true;
+    }
+    if timeout_state
+        .cancellation
+        .as_ref()
+        .is_some_and(|cancellation| cancellation.cancelled())
+    {
+        outcome.timed_out = false;
+        if can_be_partial {
+            outcome.partial = true;
+            outcome
+                .warnings
+                .push("query cancelled; returning partial rows".to_string());
+        } else {
+            outcome.result.rows.clear();
+            outcome.error = Some("Query cancelled".to_string());
+        }
+        return true;
+    }
+    if timeout_state.timed_out {
+        outcome.timed_out = true;
+        if can_be_partial {
+            outcome.partial = true;
+            outcome
+                .warnings
+                .push("query timed out; returning partial rows".to_string());
+        } else {
+            outcome.result.rows.clear();
+            outcome.error = Some("Query timed out".to_string());
+        }
+        return true;
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+struct ProgressRegistration {
+    steps: i32,
+    user_data: *mut c_void,
+}
+
+thread_local! {
+    static LIBXSQL_PROGRESS_HANDLERS: RefCell<HashMap<usize, ProgressRegistration>> =
+        RefCell::new(HashMap::new());
+}
+
+struct ProgressHandlerGuard {
+    db: *mut ffi::sqlite3,
+    previous: Option<ProgressRegistration>,
+}
+
+impl ProgressHandlerGuard {
+    fn install(db: *mut ffi::sqlite3, steps: i32, user_data: *mut c_void) -> Self {
+        let registration = ProgressRegistration { steps, user_data };
+        let previous = LIBXSQL_PROGRESS_HANDLERS
+            .with(|handlers| handlers.borrow_mut().insert(db as usize, registration));
+        unsafe {
+            ffi::sqlite3_progress_handler(db, steps, Some(progress_callback), user_data);
+        }
+        Self { db, previous }
+    }
+}
+
+impl Drop for ProgressHandlerGuard {
+    fn drop(&mut self) {
+        LIBXSQL_PROGRESS_HANDLERS.with(|handlers| {
+            let mut handlers = handlers.borrow_mut();
+            if let Some(previous) = self.previous {
+                handlers.insert(self.db as usize, previous);
+                unsafe {
+                    ffi::sqlite3_progress_handler(
+                        self.db,
+                        previous.steps,
+                        Some(progress_callback),
+                        previous.user_data,
+                    );
+                }
+            } else {
+                handlers.remove(&(self.db as usize));
+                unsafe {
+                    ffi::sqlite3_progress_handler(self.db, 0, None, std::ptr::null_mut());
+                }
+            }
+        });
+    }
+}
+
+struct QueryInterruptGuard {
+    progress: Option<ProgressHandlerGuard>,
+    previous_checker: Option<crate::vtab::VtabInterruptChecker>,
+}
+
+impl QueryInterruptGuard {
+    fn install(
+        db: *mut ffi::sqlite3,
+        enabled: bool,
+        progress_steps: i32,
+        user_data: *mut c_void,
+        checker: crate::vtab::VtabInterruptChecker,
+    ) -> Self {
+        if !enabled {
+            return Self {
+                progress: None,
+                previous_checker: None,
+            };
+        }
+        let progress = Some(ProgressHandlerGuard::install(db, progress_steps, user_data));
+        let previous_checker = crate::vtab::replace_vtab_interrupt_checker(Some(checker));
+        Self {
+            progress,
+            previous_checker,
+        }
+    }
+}
+
+impl Drop for QueryInterruptGuard {
+    fn drop(&mut self) {
+        if self.progress.is_some() {
+            let previous = self.previous_checker.take();
+            let _ = crate::vtab::replace_vtab_interrupt_checker(previous);
+            drop(self.progress.take());
+        }
+    }
 }
 
 extern "C" fn progress_callback(user_data: *mut std::ffi::c_void) -> i32 {
@@ -729,12 +1246,25 @@ extern "C" fn progress_callback(user_data: *mut std::ffi::c_void) -> i32 {
         return 0;
     }
     let state = unsafe { &mut *user_data.cast::<TimeoutState>() };
-    if state.started.elapsed() >= state.timeout {
-        state.timed_out = true;
-        1
-    } else {
-        0
+    i32::from(poll_timeout_state(state))
+}
+
+fn poll_timeout_state(state: &mut TimeoutState) -> bool {
+    // Cancellation takes precedence over the deadline and works even when
+    // timeout_ms == 0 (a server bounding an otherwise-unlimited query). Mirrors
+    // the C++ ProgressHandler::callback.
+    if state
+        .cancellation
+        .as_ref()
+        .is_some_and(|cancellation| cancellation.poll())
+    {
+        return true;
     }
+    if state.timeout_enabled && state.started.elapsed() >= state.timeout {
+        state.timed_out = true;
+        return true;
+    }
+    false
 }
 
 type ScalarCallback = dyn for<'a> Fn(&mut FunctionContext<'a>, &[FunctionArg<'a>]) + 'static;

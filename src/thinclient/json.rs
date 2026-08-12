@@ -1,8 +1,8 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 use serde_json::json;
 
@@ -49,6 +49,15 @@ pub trait ThinclientJsonResult {
 
     /// Result rows as string cells (empty by default).
     fn rows(&self) -> Vec<Vec<String>> {
+        Vec::new()
+    }
+
+    /// Per-cell SQL-NULL flags parallel to [`Self::rows`] (empty by default). When
+    /// a cell is flagged `true`, [`result_to_json`] emits JSON `null` for it instead
+    /// of the string value, so a real SQL NULL stays distinct from a genuine text
+    /// value (including "" or "NULL"). An empty result (or shorter inner vectors)
+    /// falls back to treating cells as non-null strings — preserving prior output.
+    fn nulls(&self) -> Vec<Vec<bool>> {
         Vec::new()
     }
 
@@ -101,6 +110,10 @@ impl ThinclientJsonResult for crate::QueryResult {
     fn rows(&self) -> Vec<Vec<String>> {
         self.rows.iter().map(|row| row.values.clone()).collect()
     }
+
+    fn nulls(&self) -> Vec<Vec<bool>> {
+        self.rows.iter().map(|row| row.nulls.clone()).collect()
+    }
 }
 
 /// Serialize a [`ThinclientJsonResult`] to the standard query response JSON:
@@ -111,11 +124,37 @@ where
 {
     if result.success() {
         let rows = result.rows();
+        let nulls = result.nulls();
+        // Emit JSON `null` for cells flagged as SQL NULL; otherwise the string
+        // value. A missing flag (empty `nulls`, or a shorter inner vector) defaults
+        // to a non-null string, preserving the prior behavior for producers that
+        // don't track nullness.
+        let json_rows: Vec<Vec<serde_json::Value>> = rows
+            .iter()
+            .enumerate()
+            .map(|(ri, row)| {
+                row.iter()
+                    .enumerate()
+                    .map(|(ci, cell)| {
+                        let is_null = nulls
+                            .get(ri)
+                            .and_then(|r| r.get(ci))
+                            .copied()
+                            .unwrap_or(false);
+                        if is_null {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::String(cell.clone())
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
         json!({
             "success": true,
             "columns": result.columns(),
-            "rows": rows,
-            "row_count": rows.len(),
+            "rows": json_rows,
+            "row_count": json_rows.len(),
         })
         .to_string()
     } else {

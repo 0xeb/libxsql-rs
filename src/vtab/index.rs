@@ -1,22 +1,28 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 use crate::error::{Error, Result, sqlite_ok};
 use crate::function::{FunctionArg, FunctionContext, build_args};
 use libsqlite3_sys as ffi;
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
+use super::column_helpers;
 use super::ffi::{
     callback_status, finish_cursor_unit, finish_vtab_unit, quote_identifier, set_vtab_error,
-    sqlite3_vtab_nochange,
+    sqlite3_vtab_nochange, unsupported_delete, unsupported_insert, unsupported_update,
 };
-use super::{ColumnType, FILTER_NONE, ModifyHook, RowIterator};
+use super::{
+    ColumnType, FILTER_NONE, ModifyHook, RowIterator, TransactionHooks, TransactionLifecycle,
+    WriteCaps, WriteSurfaceRegistry, apply_update_columns, connect_write_surface,
+    destroy_write_surface,
+};
 
 type Getter = dyn for<'a> Fn(&mut FunctionContext<'a>, usize) + 'static;
 type Setter = dyn for<'a> Fn(usize, &FunctionArg<'a>) -> bool + 'static;
@@ -51,6 +57,7 @@ struct TableInner {
     columns: Vec<ColumnDef>,
     filters: Vec<FilterDef>,
     before_modify: Option<Box<ModifyHook>>,
+    transaction_hooks: TransactionHooks,
     delete_row: Option<Box<dyn Fn(usize) -> bool + 'static>>,
     insert_row: Option<Box<InsertFn>>,
 }
@@ -97,6 +104,24 @@ impl TableDef {
     pub fn name(&self) -> &str {
         &self.inner.name
     }
+
+    /// Compute the write-surface capabilities for the prepare-time authorizer
+    /// (mirrors the C++ `record_write_surface` call for the base module):
+    /// insertable/deletable iff the respective callback is present, updatable iff
+    /// any column has a setter.
+    pub(crate) fn write_caps(&self) -> super::WriteCaps {
+        super::WriteCaps {
+            insertable: self.inner.insert_row.is_some(),
+            deletable: self.inner.delete_row.is_some(),
+            writable_columns: self
+                .inner
+                .columns
+                .iter()
+                .filter(|column| column.setter.is_some())
+                .map(|column| column.name.to_ascii_lowercase())
+                .collect(),
+        }
+    }
 }
 
 /// Start an index-based virtual table definition.
@@ -108,6 +133,7 @@ pub fn table(name: impl Into<String>) -> TableBuilder {
         columns: Vec::new(),
         filters: Vec::new(),
         before_modify: None,
+        transaction_hooks: TransactionHooks::default(),
         delete_row: None,
         insert_row: None,
     }
@@ -121,6 +147,7 @@ pub struct TableBuilder {
     columns: Vec<ColumnDef>,
     filters: Vec<FilterDef>,
     before_modify: Option<Box<ModifyHook>>,
+    transaction_hooks: TransactionHooks,
     delete_row: Option<Box<dyn Fn(usize) -> bool + 'static>>,
     insert_row: Option<Box<InsertFn>>,
 }
@@ -154,19 +181,19 @@ impl TableBuilder {
         self
     }
 
+    /// Install the complete SQLite transaction lifecycle for this table.
+    pub fn transaction_hooks(mut self, transaction_hooks: TransactionHooks) -> Self {
+        self.transaction_hooks = transaction_hooks;
+        self
+    }
+
     /// Add a column with a custom getter that writes the value for a given row
     /// index into the context.
-    pub fn column<F>(mut self, name: impl Into<String>, column_type: ColumnType, getter: F) -> Self
+    pub fn column<F>(self, name: impl Into<String>, column_type: ColumnType, getter: F) -> Self
     where
         F: for<'a> Fn(&mut FunctionContext<'a>, usize) + 'static,
     {
-        self.columns.push(ColumnDef {
-            name: name.into(),
-            column_type,
-            getter: Box::new(getter),
-            setter: None,
-        });
-        self
+        self.add_column(name, column_type, Box::new(getter), None)
     }
 
     /// Add an `INTEGER` column whose getter returns an `i32` for a row index.
@@ -174,9 +201,12 @@ impl TableBuilder {
     where
         F: Fn(usize) -> i32 + 'static,
     {
-        self.column(name, ColumnType::Integer, move |ctx, row| {
-            ctx.result_int(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::index_getter_int(getter),
+            None,
+        )
     }
 
     /// Add an `INTEGER` column whose getter returns an `i64` for a row index.
@@ -184,9 +214,12 @@ impl TableBuilder {
     where
         F: Fn(usize) -> i64 + 'static,
     {
-        self.column(name, ColumnType::Integer, move |ctx, row| {
-            ctx.result_i64(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::index_getter_i64(getter),
+            None,
+        )
     }
 
     /// Alias for [`column_i64`](Self::column_i64).
@@ -202,9 +235,12 @@ impl TableBuilder {
     where
         F: Fn(usize) -> String + 'static,
     {
-        self.column(name, ColumnType::Text, move |ctx, row| {
-            ctx.result_text(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Text,
+            column_helpers::index_getter_text(getter),
+            None,
+        )
     }
 
     /// Add a `REAL` column whose getter returns an `f64` for a row index.
@@ -212,9 +248,12 @@ impl TableBuilder {
     where
         F: Fn(usize) -> f64 + 'static,
     {
-        self.column(name, ColumnType::Real, move |ctx, row| {
-            ctx.result_double(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Real,
+            column_helpers::index_getter_double(getter),
+            None,
+        )
     }
 
     /// Add a `BLOB` column whose getter returns a `Vec<u8>` for a row index.
@@ -222,41 +261,42 @@ impl TableBuilder {
     where
         F: Fn(usize) -> Vec<u8> + 'static,
     {
-        self.column(name, ColumnType::Blob, move |ctx, row| {
-            ctx.result_blob(&getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Blob,
+            column_helpers::index_getter_blob(getter),
+            None,
+        )
     }
 
     /// Add a writable `INTEGER` (`i32`) column with a getter and a setter; the
     /// setter returns false to reject the write.
-    pub fn column_int_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_int_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(usize) -> i32 + 'static,
         S: Fn(usize, i32) -> bool + 'static,
     {
-        self.columns.push(ColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Integer,
-            getter: Box::new(move |ctx, row| ctx.result_int(getter(row))),
-            setter: Some(Box::new(move |row, value| setter(row, value.as_i32()))),
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::index_getter_int(getter),
+            Some(column_helpers::index_setter_int(setter)),
+        )
     }
 
     /// Add a writable `INTEGER` (`i64`) column with a getter and a setter; the
     /// setter returns false to reject the write.
-    pub fn column_i64_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_i64_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(usize) -> i64 + 'static,
         S: Fn(usize, i64) -> bool + 'static,
     {
-        self.columns.push(ColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Integer,
-            getter: Box::new(move |ctx, row| ctx.result_i64(getter(row))),
-            setter: Some(Box::new(move |row, value| setter(row, value.as_i64()))),
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::index_getter_i64(getter),
+            Some(column_helpers::index_setter_i64(setter)),
+        )
     }
 
     /// Alias for [`column_i64_rw`](Self::column_i64_rw).
@@ -270,27 +310,23 @@ impl TableBuilder {
 
     /// Add a writable `TEXT` column with a getter and a setter; the setter
     /// returns false to reject the write.
-    pub fn column_text_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_text_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(usize) -> String + 'static,
         S: Fn(usize, &str) -> bool + 'static,
     {
-        self.columns.push(ColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Text,
-            getter: Box::new(move |ctx, row| ctx.result_text(getter(row))),
-            setter: Some(Box::new(move |row, value| {
-                let text = value.as_c_str().map(CStr::to_string_lossy);
-                setter(row, text.as_deref().unwrap_or(""))
-            })),
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Text,
+            column_helpers::index_getter_text(getter),
+            Some(column_helpers::index_setter_text(setter)),
+        )
     }
 
     /// Add a writable `TEXT` column whose getter may return `None` (emitting SQL
     /// NULL); the setter receives the raw argument.
     pub fn column_text_nullable_rw<G, S>(
-        mut self,
+        self,
         name: impl Into<String>,
         getter: G,
         setter: S,
@@ -299,22 +335,18 @@ impl TableBuilder {
         G: Fn(usize) -> Option<String> + 'static,
         S: for<'a> Fn(usize, &FunctionArg<'a>) -> bool + 'static,
     {
-        self.columns.push(ColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Text,
-            getter: Box::new(move |ctx, row| match getter(row) {
-                Some(value) => ctx.result_text(value),
-                None => ctx.result_null(),
-            }),
-            setter: Some(Box::new(setter)),
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Text,
+            column_helpers::index_getter_nullable_text(getter),
+            Some(Box::new(setter)),
+        )
     }
 
     /// Add a writable column with a custom getter and setter operating on a row
     /// index.
     pub fn column_rw<G, S>(
-        mut self,
+        self,
         name: impl Into<String>,
         column_type: ColumnType,
         getter: G,
@@ -324,13 +356,7 @@ impl TableBuilder {
         G: for<'a> Fn(&mut FunctionContext<'a>, usize) + 'static,
         S: for<'a> Fn(usize, &FunctionArg<'a>) -> bool + 'static,
     {
-        self.columns.push(ColumnDef {
-            name: name.into(),
-            column_type,
-            getter: Box::new(getter),
-            setter: Some(Box::new(setter)),
-        });
-        self
+        self.add_column(name, column_type, Box::new(getter), Some(Box::new(setter)))
     }
 
     /// Make the table deletable via a callback that deletes the row at the given
@@ -455,6 +481,7 @@ impl TableBuilder {
                 columns: self.columns,
                 filters: self.filters,
                 before_modify: self.before_modify,
+                transaction_hooks: self.transaction_hooks,
                 delete_row: self.delete_row,
                 insert_row: self.insert_row,
             }),
@@ -507,6 +534,22 @@ impl TableBuilder {
         self
     }
 
+    fn add_column(
+        mut self,
+        name: impl Into<String>,
+        column_type: ColumnType,
+        getter: Box<Getter>,
+        setter: Option<Box<Setter>>,
+    ) -> Self {
+        self.columns.push(ColumnDef {
+            name: name.into(),
+            column_type,
+            getter,
+            setter,
+        });
+        self
+    }
+
     fn find_column(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|column| column.name == name)
     }
@@ -516,12 +559,18 @@ impl TableBuilder {
 struct ModuleState {
     module: ffi::sqlite3_module,
     def: Rc<TableInner>,
+    registry: *const RefCell<WriteSurfaceRegistry>,
+    caps: WriteCaps,
 }
 
 #[repr(C)]
 struct Vtab {
     base: ffi::sqlite3_vtab,
     def: Rc<TableInner>,
+    transaction: TransactionLifecycle,
+    registry: *const RefCell<WriteSurfaceRegistry>,
+    schema_name: String,
+    table_name: String,
 }
 
 #[repr(C)]
@@ -538,6 +587,7 @@ struct Cursor {
 
 pub(crate) fn register_index_table(
     db: *mut ffi::sqlite3,
+    registry: *const RefCell<WriteSurfaceRegistry>,
     module_name: &str,
     def: &TableDef,
 ) -> Result<()> {
@@ -548,6 +598,8 @@ pub(crate) fn register_index_table(
     let state = Box::new(ModuleState {
         module: create_module(),
         def: def.inner.clone(),
+        registry,
+        caps: def.write_caps(),
     });
     let state_ptr = Box::into_raw(state);
     let module_ptr = unsafe { &(*state_ptr).module as *const ffi::sqlite3_module };
@@ -574,7 +626,7 @@ fn create_module() -> ffi::sqlite3_module {
     module.xConnect = Some(vtab_connect);
     module.xBestIndex = Some(vtab_best_index);
     module.xDisconnect = Some(vtab_disconnect);
-    module.xDestroy = Some(vtab_disconnect);
+    module.xDestroy = Some(vtab_destroy);
     module.xOpen = Some(vtab_open);
     module.xClose = Some(vtab_close);
     module.xFilter = Some(vtab_filter);
@@ -583,6 +635,16 @@ fn create_module() -> ffi::sqlite3_module {
     module.xColumn = Some(vtab_column);
     module.xRowid = Some(vtab_rowid);
     module.xUpdate = Some(vtab_update);
+    // xBegin enrolls the vtab. The fallible hook runs from xSync, whose return
+    // SQLite propagates; xCommit only clears state because SQLite ignores its
+    // return code.
+    module.xBegin = Some(vtab_begin);
+    module.xSync = Some(vtab_sync);
+    module.xCommit = Some(vtab_commit);
+    module.xRollback = Some(vtab_rollback);
+    module.xSavepoint = Some(vtab_savepoint);
+    module.xRelease = Some(vtab_release);
+    module.xRollbackTo = Some(vtab_rollback_to);
     module
 }
 
@@ -597,8 +659,8 @@ unsafe extern "C" fn destroy_module_state(ptr: *mut c_void) {
 unsafe extern "C" fn vtab_connect(
     db: *mut ffi::sqlite3,
     p_aux: *mut c_void,
-    _argc: c_int,
-    _argv: *const *const c_char,
+    argc: c_int,
+    argv: *const *const c_char,
     pp_vtab: *mut *mut ffi::sqlite3_vtab,
     pz_err: *mut *mut c_char,
 ) -> c_int {
@@ -613,14 +675,32 @@ unsafe extern "C" fn vtab_connect(
             if !sqlite_ok(rc) {
                 return Err(Error::sqlite(rc, crate::function::sqlite_error(db)));
             }
+            let transaction = TransactionLifecycle::new(&state.def.transaction_hooks)?;
+            let (schema_name, table_name) =
+                connect_write_surface(state.registry, argc, argv, state.caps.clone())?;
             let vtab = Box::new(Vtab {
                 base: std::mem::zeroed(),
                 def: state.def.clone(),
+                transaction,
+                registry: state.registry,
+                schema_name,
+                table_name,
             });
             let vtab_ptr = Box::into_raw(vtab);
             *pp_vtab = &mut (*vtab_ptr).base;
             Ok(ffi::SQLITE_OK)
         })
+    }
+}
+
+unsafe extern "C" fn vtab_destroy(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if !p_vtab.is_null() {
+            let vtab = Box::from_raw(p_vtab.cast::<Vtab>());
+            destroy_write_surface(vtab.registry, &vtab.schema_name, &vtab.table_name);
+            drop(vtab);
+        }
+        ffi::SQLITE_OK
     }
 }
 
@@ -903,49 +983,80 @@ unsafe extern "C" fn vtab_update(
 
             if argc == 1 && !old_rowid.is_null() {
                 let Some(delete_row) = vtab.def.delete_row.as_ref() else {
-                    return Ok(ffi::SQLITE_READONLY);
+                    return Ok(unsupported_delete(p_vtab, &vtab.def.name));
                 };
+                // A negative rowid cannot map to a valid 0-based row index; reject
+                // it before it wraps to a huge usize handed to the delete callback.
+                let raw_rowid = old_rowid.as_i64();
+                if raw_rowid < 0 {
+                    return Err(Error::Message("virtual table delete failed".to_string()));
+                }
+                vtab.transaction.touch();
                 call_modify_hook(&vtab.def, &format!("DELETE FROM {}", vtab.def.name));
-                if delete_row(old_rowid.as_i64() as usize) {
+                if delete_row(raw_rowid as usize) {
+                    vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
                 return Err(Error::Message("virtual table delete failed".to_string()));
             }
 
             if argc > 1 && !old_rowid.is_null() {
-                call_modify_hook(&vtab.def, &format!("UPDATE {}", vtab.def.name));
-                let old_rowid = old_rowid.as_i64() as usize;
-                for i in 2..argc {
-                    let column_index = (i - 2) as usize;
-                    if column_index >= vtab.def.columns.len() {
-                        break;
-                    }
-                    let value = FunctionArg::new(*argv.add(i as usize));
-                    if value.is_nochange() {
-                        continue;
-                    }
-                    if let Some(setter) = vtab.def.columns[column_index].setter.as_ref()
-                        && !setter(old_rowid, &value)
-                    {
-                        return Err(Error::Message(format!(
-                            "virtual table update failed for column '{}'",
-                            vtab.def.columns[column_index].name
-                        )));
-                    }
+                // No writable column at all -> the UPDATE surface is unsupported;
+                // report the capability-scoped error (mirrors the C++ base module's
+                // unsupported_update, and matches the recorded caps / authorizer).
+                if !vtab
+                    .def
+                    .columns
+                    .iter()
+                    .any(|column| column.setter.is_some())
+                {
+                    return Ok(unsupported_update(p_vtab, &vtab.def.name));
                 }
+                // A negative rowid cannot map to a valid 0-based row index; reject
+                // it before it wraps to a huge usize handed to the column setters.
+                let raw_rowid = old_rowid.as_i64();
+                if raw_rowid < 0 {
+                    return Err(Error::Message(
+                        "virtual table update failed: negative rowid".to_string(),
+                    ));
+                }
+                vtab.transaction.touch();
+                call_modify_hook(&vtab.def, &format!("UPDATE {}", vtab.def.name));
+                let old_rowid = raw_rowid as usize;
+                // A row here is always resolved by rowid, so unchanged columns arrive
+                // as NOCHANGE -- always NOCHANGE-eligible.
+                let args = build_args(argc - 2, argv.add(2));
+                apply_update_columns(
+                    &args,
+                    vtab.def.columns.len(),
+                    true,
+                    |i| vtab.def.columns[i].setter.is_some(),
+                    |i| vtab.def.columns[i].name.clone(),
+                    |i, value| {
+                        vtab.def.columns[i]
+                            .setter
+                            .as_ref()
+                            .expect("apply runs only for writable columns")(
+                            old_rowid, value
+                        )
+                    },
+                )?;
+                vtab.transaction.mark_written();
                 return Ok(ffi::SQLITE_OK);
             }
 
             if argc > 1 && old_rowid.is_null() {
                 let Some(insert_row) = vtab.def.insert_row.as_ref() else {
-                    return Ok(ffi::SQLITE_READONLY);
+                    return Ok(unsupported_insert(p_vtab, &vtab.def.name));
                 };
+                vtab.transaction.touch();
                 call_modify_hook(&vtab.def, &format!("INSERT INTO {}", vtab.def.name));
                 let args = build_args(argc - 2, argv.add(2));
                 if insert_row(&args) {
                     if !rowid.is_null() {
                         *rowid = 0;
                     }
+                    vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
                 return Err(Error::Message("virtual table insert failed".to_string()));
@@ -964,6 +1075,92 @@ unsafe extern "C" fn vtab_update(
                 ffi::SQLITE_ERROR
             }
         }
+    }
+}
+
+unsafe extern "C" fn vtab_begin(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if let Some(vtab) = p_vtab.cast::<Vtab>().as_ref() {
+            vtab.transaction.begin();
+        }
+        ffi::SQLITE_OK
+    }
+}
+
+unsafe extern "C" fn vtab_sync(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<Vtab>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql vtab is null".to_string()))?;
+            vtab.transaction.sync(&vtab.def.transaction_hooks)
+        }));
+        finish_vtab_unit(p_vtab, result)
+    }
+}
+
+unsafe extern "C" fn vtab_commit(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if let Some(vtab) = p_vtab.cast::<Vtab>().as_ref() {
+            // SQLite ignores xCommit/xRollback errors. Contain a panic without
+            // allocating zErrMsg that nobody will consume or free.
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                vtab.transaction.commit(&vtab.def.transaction_hooks);
+            }));
+        }
+        ffi::SQLITE_OK
+    }
+}
+
+unsafe extern "C" fn vtab_rollback(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if let Some(vtab) = p_vtab.cast::<Vtab>().as_ref() {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                vtab.transaction.rollback(&vtab.def.transaction_hooks);
+            }));
+        }
+        ffi::SQLITE_OK
+    }
+}
+
+unsafe extern "C" fn vtab_savepoint(p_vtab: *mut ffi::sqlite3_vtab, id: c_int) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<Vtab>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql vtab is null".to_string()))?;
+            vtab.transaction.savepoint(&vtab.def.transaction_hooks, id)
+        }));
+        finish_vtab_unit(p_vtab, result)
+    }
+}
+
+unsafe extern "C" fn vtab_release(p_vtab: *mut ffi::sqlite3_vtab, id: c_int) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<Vtab>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql vtab is null".to_string()))?;
+            vtab.transaction.release(&vtab.def.transaction_hooks, id)
+        }));
+        finish_vtab_unit(p_vtab, result)
+    }
+}
+
+unsafe extern "C" fn vtab_rollback_to(p_vtab: *mut ffi::sqlite3_vtab, id: c_int) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<Vtab>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql vtab is null".to_string()))?;
+            vtab.transaction
+                .rollback_to(&vtab.def.transaction_hooks, id)
+        }));
+        finish_vtab_unit(p_vtab, result)
     }
 }
 

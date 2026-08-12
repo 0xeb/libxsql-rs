@@ -1,8 +1,8 @@
-// Copyright (c) 2026 Elias Bachaalany
+// Copyright (c) 2024-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 use crate::error::{Error, Result, sqlite_ok};
 use crate::function::{FunctionArg, FunctionContext, build_args};
@@ -14,22 +14,49 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
+use super::column_helpers;
 use super::ffi::{
     call_cached_modify_hook, callback_status, finish_cursor_unit, finish_vtab_unit,
     like_constraint_has_usable_prefix, parse_col_used, quote_identifier, set_vtab_error,
-    sqlite_mprintf_string, sqlite3_vtab_nochange,
+    sqlite_mprintf_string, sqlite3_vtab_nochange, unsupported_delete, unsupported_insert,
+    unsupported_update,
 };
 use super::index::InsertFn;
-use super::{ColumnType, FILTER_NONE, ModifyHook, RowIterator};
+use super::{
+    ColumnType, FILTER_NONE, ModifyHook, RowIterator, TransactionHooks, TransactionLifecycle,
+    TransactionState, WriteCaps, WriteSurfaceRegistry, apply_update_columns, connect_write_surface,
+    destroy_write_surface,
+};
 
 const CACHED_ROWID_SCAN: c_int = -3;
 const CACHED_COUNT_ONLY_SCAN: c_int = -1;
+// An equality index lookup uses idxNum = CACHED_INDEX_BASE + index_pos.
 const CACHED_INDEX_BASE: c_int = 10_000;
+
+// Range (>=, >, <=, <, BETWEEN) pushdown on an indexed column. Encoded as
+//   idxNum = CACHED_RANGE_BASE + index_pos * CACHED_RANGE_STRIDE + range_flags
+// where range_flags is a 4-bit mask. CACHED_RANGE_BASE sits ABOVE the equality
+// index space (`CACHED_INDEX_BASE + index_pos`) so the two never collide;
+// `index_pos * CACHED_RANGE_STRIDE` reserves 16 flag values per index. A range
+// plan always sets idxNum >= CACHED_RANGE_BASE > 0, so the equality encoding is
+// unchanged and a full scan still reports "VIRTUAL TABLE INDEX 0". argv order is
+// [low?, high?] (low first when both bounds are present, matching how
+// xBestIndex assigns argvIndex). Mirrors the C++ RANGE_BASE encoding; only the
+// numeric base differs, tracking this port's larger CACHED_INDEX_BASE.
+const CACHED_RANGE_BASE: c_int = 20_000;
+const CACHED_RANGE_STRIDE: c_int = 16; // 4 flag bits per index slot
+const RANGE_HAS_LOW: c_int = 0x1; // a lower bound (>= or >) is present
+const RANGE_LOW_STRICT: c_int = 0x2; // lower bound is strict (>, not >=)
+const RANGE_HAS_HIGH: c_int = 0x4; // an upper bound (<= or <) is present
+const RANGE_HIGH_STRICT: c_int = 0x8; // upper bound is strict (<, not <=)
+const RANGE_FLAG_MASK: c_int =
+    RANGE_HAS_LOW | RANGE_LOW_STRICT | RANGE_HAS_HIGH | RANGE_HIGH_STRICT;
 
 type CachedGetter<Row> = dyn for<'a> Fn(&mut FunctionContext<'a>, &Row) + 'static;
 type CachedSetter<Row> = dyn for<'a> Fn(&mut Row, &FunctionArg<'a>) -> bool + 'static;
 type CachedBuilder<Row> = dyn Fn(&mut Vec<Row>) + 'static;
 type CachedProjectionBuilder<Row> = dyn Fn(&mut Vec<Row>, u64) + 'static;
+type StatefulCachedBuilder<Row> = dyn Fn(&TransactionState, &mut Vec<Row>) + 'static;
 pub(crate) type CachedCount = dyn Fn() -> usize + 'static;
 pub(crate) type CachedFilterFactory =
     dyn for<'a> Fn(&FunctionArg<'a>) -> Box<dyn RowIterator> + 'static;
@@ -61,9 +88,90 @@ struct CachedIndexDef<Row> {
     key: Box<CachedIndexKey<Row>>,
 }
 
+/// A per-index sorted view used ONLY for range (>=, >, <=, <, BETWEEN)
+/// pushdown. The hash `indexes` stay the sole structure for the hot equality
+/// path; this parallel structure is built LAZILY on the first range query for an
+/// index and then cached alongside the hash index (invalidated on the same
+/// rebuilds). It is a stable-sorted vector of `(key, row-position)` pairs so a
+/// binary search can carve out the matching window; duplicate keys sort together
+/// (in row order), so a multi-match key is a contiguous run. `built` gates a
+/// one-time construction. Mirrors the C++ `detail::SortedIndex`.
+#[derive(Default)]
+struct SortedIndex {
+    entries: Vec<(i64, usize)>, // sorted by key ascending, stable in row order
+    built: bool,
+}
+
+impl SortedIndex {
+    /// Build (once) the sorted `(key, row)` view from a data slice + its key
+    /// extractor. A stable sort keeps a deterministic per-key order (matching
+    /// the data order for equal keys), so the window a range carves is
+    /// reproducible. Mirrors the C++ `detail::build_sorted_index`.
+    fn build<Row>(&mut self, data: &[Row], key: &CachedIndexKey<Row>) {
+        self.entries.clear();
+        self.entries.reserve(data.len());
+        for (row, item) in data.iter().enumerate() {
+            self.entries.push((key(item), row));
+        }
+        // stable sort by key: equal keys keep their original row order.
+        self.entries.sort_by_key(|(k, _)| *k);
+        self.built = true;
+    }
+
+    /// Carve the matching window honoring the range flags + bounds and append
+    /// the matching row positions to `out`. `low`/`high` are only read when the
+    /// corresponding `RANGE_HAS_*` flag is set. Mirrors the C++
+    /// `detail::collect_range_matches` (`partition_point` replaces
+    /// `lower_bound`/`upper_bound`).
+    fn collect_matches(&self, range_flags: c_int, low: i64, high: i64, out: &mut Vec<usize>) {
+        // begin index: first entry included by the low bound.
+        let begin = if range_flags & RANGE_HAS_LOW != 0 {
+            if range_flags & RANGE_LOW_STRICT != 0 {
+                // > low : first key strictly greater than low.
+                self.entries.partition_point(|(k, _)| *k <= low)
+            } else {
+                // >= low : first key not less than low.
+                self.entries.partition_point(|(k, _)| *k < low)
+            }
+        } else {
+            0
+        };
+        // end index: one past the last entry included by the high bound.
+        let end = if range_flags & RANGE_HAS_HIGH != 0 {
+            if range_flags & RANGE_HIGH_STRICT != 0 {
+                // < high : first key not less than high.
+                self.entries.partition_point(|(k, _)| *k < high)
+            } else {
+                // <= high : one past the last key not greater than high.
+                self.entries.partition_point(|(k, _)| *k <= high)
+            }
+        } else {
+            self.entries.len()
+        };
+        if begin < end {
+            out.extend(self.entries[begin..end].iter().map(|(_, row)| *row));
+        }
+    }
+}
+
+/// Decode a range idxNum into `(index_pos, range_flags)`, or `None` if it is not
+/// a range plan. Keeps the encoding math in one place for xFilter.
+fn decode_range_idx(idx_num: c_int) -> Option<(usize, c_int)> {
+    if idx_num < CACHED_RANGE_BASE {
+        return None;
+    }
+    let encoded = idx_num - CACHED_RANGE_BASE;
+    let index_pos = (encoded / CACHED_RANGE_STRIDE) as usize;
+    let range_flags = encoded & RANGE_FLAG_MASK;
+    Some((index_pos, range_flags))
+}
+
 struct SharedCache<Row> {
     data: Vec<Row>,
     indexes: Vec<HashMap<i64, Vec<usize>>>,
+    /// Parallel sorted views for range pushdown, one slot per hash index. Built
+    /// on demand (first range query), cleared whenever `indexes` is.
+    sorted_indexes: Vec<SortedIndex>,
     built: bool,
     /// True when `data` is retained as a snapshot of an in-progress scan-driven
     /// mutation even though `built` is false. While set, the cursor read paths
@@ -77,6 +185,7 @@ impl<Row> Default for SharedCache<Row> {
         Self {
             data: Vec::new(),
             indexes: Vec::new(),
+            sorted_indexes: Vec::new(),
             built: false,
             mutation_snapshot: false,
         }
@@ -89,12 +198,14 @@ struct CachedInner<Row> {
     row_count: Option<Box<CachedCount>>,
     cache_builder: Option<Box<CachedBuilder<Row>>>,
     projection_cache_builder: Option<Box<CachedProjectionBuilder<Row>>>,
+    stateful_cache_builder: Option<Box<StatefulCachedBuilder<Row>>>,
     columns: Vec<CachedColumnDef<Row>>,
     filters: Vec<CachedFilterDef>,
     indexes: Vec<CachedIndexDef<Row>>,
     rowid: Option<Box<CachedRowid<Row>>>,
     before_modify: Option<Box<ModifyHook>>,
     after_modify: Option<Box<ModifyHook>>,
+    transaction_hooks: TransactionHooks,
     delete_row: Option<Box<CachedDelete<Row>>>,
     insert_row: Option<Box<InsertFn>>,
     row_lookup: Option<Box<CachedLookup<Row>>>,
@@ -140,13 +251,21 @@ impl<Row> CachedInner<Row> {
             .position(|index| index.column_index == column_index)
     }
 
-    fn build_rows(&self, rows: &mut Vec<Row>, col_used: u64) {
+    fn build_rows(&self, state: &TransactionState, rows: &mut Vec<Row>, col_used: u64) {
         rows.clear();
-        if let Some(projection_cache_builder) = self.projection_cache_builder.as_ref() {
+        if let Some(stateful_cache_builder) = self.stateful_cache_builder.as_ref() {
+            stateful_cache_builder(state, rows);
+        } else if let Some(projection_cache_builder) = self.projection_cache_builder.as_ref() {
             projection_cache_builder(rows, col_used);
         } else if let Some(cache_builder) = self.cache_builder.as_ref() {
             cache_builder(rows);
         }
+    }
+
+    fn has_cache_builder(&self) -> bool {
+        self.cache_builder.is_some()
+            || self.projection_cache_builder.is_some()
+            || self.stateful_cache_builder.is_some()
     }
 
     fn ensure_shared_cache(&self) {
@@ -159,6 +278,9 @@ impl<Row> CachedInner<Row> {
         let mut cache = self.shared_cache.borrow_mut();
         cache.data.clear();
         cache.indexes.clear();
+        // The parallel sorted (range) views are built lazily on the first range
+        // query (see the xFilter range branch); we only size the slot vector here.
+        cache.sorted_indexes.clear();
         if let Some(cache_builder) = self.cache_builder.as_ref() {
             cache_builder(&mut cache.data);
         }
@@ -171,6 +293,9 @@ impl<Row> CachedInner<Row> {
             indexes.push(map);
         }
         cache.indexes = indexes;
+        cache
+            .sorted_indexes
+            .resize_with(self.indexes.len(), SortedIndex::default);
         cache.built = true;
         cache.mutation_snapshot = false;
     }
@@ -185,6 +310,7 @@ impl<Row> CachedInner<Row> {
         }
         let mut cache = self.shared_cache.borrow_mut();
         cache.indexes.clear();
+        cache.sorted_indexes.clear();
         cache.built = false;
         cache.mutation_snapshot = !cache.data.is_empty();
     }
@@ -199,6 +325,7 @@ impl<Row> CachedInner<Row> {
         let mut cache = self.shared_cache.borrow_mut();
         cache.data.clear();
         cache.indexes.clear();
+        cache.sorted_indexes.clear();
         cache.built = false;
         cache.mutation_snapshot = false;
     }
@@ -208,6 +335,65 @@ impl<Row> CachedInner<Row> {
     /// fast path. Mirrors the C++ `cached_table_has_scan_driven_mutation`.
     fn has_scan_driven_mutation(&self) -> bool {
         self.delete_row.is_some() || self.columns.iter().any(|column| column.setter.is_some())
+    }
+
+    /// Query-scoped analog of the shared-cache mutation snapshot: a NON-shared,
+    /// full-scan (no filter), positional table (no `row_lookup` / `rowid`) whose
+    /// scan-driven UPDATE/DELETE needs the pre-mutation cache frozen for the whole
+    /// statement (positional rowids stay valid). Mirrors the C++
+    /// `query_scoped_uses_mutation_snapshot` (filter tables are excluded: a filter
+    /// iterator rowid may be iterator-local, not a global cache position).
+    fn query_scoped_uses_mutation_snapshot(&self) -> bool {
+        !self.use_shared_cache
+            && self.row_lookup.is_none()
+            && self.rowid.is_none()
+            && self.filters.is_empty()
+            && self.has_cache_builder()
+            && self.has_scan_driven_mutation()
+    }
+
+    /// Build (once) a snapshot of the pre-mutation cache in `shared_cache` so a
+    /// scan-driven multi-row UPDATE/DELETE on a query-scoped table keeps stable
+    /// positional rowids for the statement.
+    fn ensure_query_scoped_mutation_snapshot(&self, state: &TransactionState) -> Result<()> {
+        if !self.query_scoped_uses_mutation_snapshot() {
+            return Ok(());
+        }
+        let mut cache = self.shared_cache.borrow_mut();
+        if !cache.mutation_snapshot {
+            cache.data.clear();
+            cache.indexes.clear();
+            cache.sorted_indexes.clear();
+            let build_result = catch_unwind(AssertUnwindSafe(|| {
+                self.build_rows(state, &mut cache.data, u64::MAX);
+            }));
+            if build_result.is_err() {
+                cache.data.clear();
+                cache.indexes.clear();
+                cache.sorted_indexes.clear();
+                cache.mutation_snapshot = false;
+                cache.built = false;
+                return Err(Error::Message(
+                    "cached table query-scoped snapshot builder panicked".to_string(),
+                ));
+            }
+            cache.mutation_snapshot = true;
+            cache.built = false;
+        }
+        Ok(())
+    }
+
+    /// Drop a query-scoped snapshot at the start of the next scan (= next
+    /// statement), so reads rebuild fresh. No-op for shared tables.
+    fn clear_query_scoped_mutation_snapshot(&self) {
+        if self.use_shared_cache {
+            return;
+        }
+        let mut cache = self.shared_cache.borrow_mut();
+        if cache.mutation_snapshot {
+            cache.data.clear();
+            cache.mutation_snapshot = false;
+        }
     }
 }
 
@@ -222,6 +408,23 @@ impl<Row> CachedTableDef<Row> {
     pub fn name(&self) -> &str {
         &self.inner.name
     }
+
+    /// Compute write-surface capabilities for the prepare-time authorizer
+    /// (mirrors the C++ cached `record_write_surface`): insertable/deletable iff
+    /// the callback is present, updatable iff any column has a setter.
+    pub(crate) fn write_caps(&self) -> super::WriteCaps {
+        super::WriteCaps {
+            insertable: self.inner.insert_row.is_some(),
+            deletable: self.inner.delete_row.is_some(),
+            writable_columns: self
+                .inner
+                .columns
+                .iter()
+                .filter(|column| column.setter.is_some())
+                .map(|column| column.name.to_ascii_lowercase())
+                .collect(),
+        }
+    }
 }
 
 /// Start a cache-backed virtual table definition.
@@ -232,12 +435,14 @@ pub fn cached_table<Row: 'static>(name: impl Into<String>) -> CachedTableBuilder
         row_count: None,
         cache_builder: None,
         projection_cache_builder: None,
+        stateful_cache_builder: None,
         columns: Vec::new(),
         filters: Vec::new(),
         indexes: Vec::new(),
         rowid: None,
         before_modify: None,
         after_modify: None,
+        transaction_hooks: TransactionHooks::default(),
         delete_row: None,
         insert_row: None,
         row_lookup: None,
@@ -254,12 +459,14 @@ pub struct CachedTableBuilder<Row> {
     row_count: Option<Box<CachedCount>>,
     cache_builder: Option<Box<CachedBuilder<Row>>>,
     projection_cache_builder: Option<Box<CachedProjectionBuilder<Row>>>,
+    stateful_cache_builder: Option<Box<StatefulCachedBuilder<Row>>>,
     columns: Vec<CachedColumnDef<Row>>,
     filters: Vec<CachedFilterDef>,
     indexes: Vec<CachedIndexDef<Row>>,
     rowid: Option<Box<CachedRowid<Row>>>,
     before_modify: Option<Box<ModifyHook>>,
     after_modify: Option<Box<ModifyHook>>,
+    transaction_hooks: TransactionHooks,
     delete_row: Option<Box<CachedDelete<Row>>>,
     insert_row: Option<Box<InsertFn>>,
     row_lookup: Option<Box<CachedLookup<Row>>>,
@@ -306,6 +513,17 @@ impl<Row: 'static> CachedTableBuilder<Row> {
         self
     }
 
+    /// Set a query-scoped builder that can read this registration's transaction
+    /// state. Stateful builders never use the definition-wide shared cache.
+    pub fn stateful_cache_builder<F>(mut self, stateful_cache_builder: F) -> Self
+    where
+        F: Fn(&TransactionState, &mut Vec<Row>) + 'static,
+    {
+        self.stateful_cache_builder = Some(Box::new(stateful_cache_builder));
+        self.use_shared_cache = false;
+        self
+    }
+
     /// Disable the process-wide shared cache; each cursor builds its own local
     /// cache instead.
     pub fn no_shared_cache(mut self) -> Self {
@@ -333,19 +551,19 @@ impl<Row: 'static> CachedTableBuilder<Row> {
         self
     }
 
+    /// Install the complete SQLite transaction lifecycle for this table.
+    pub fn transaction_hooks(mut self, transaction_hooks: TransactionHooks) -> Self {
+        self.transaction_hooks = transaction_hooks;
+        self
+    }
+
     /// Add a column with a custom getter that writes the value for a row
     /// reference into the context.
-    pub fn column<F>(mut self, name: impl Into<String>, column_type: ColumnType, getter: F) -> Self
+    pub fn column<F>(self, name: impl Into<String>, column_type: ColumnType, getter: F) -> Self
     where
         F: for<'a> Fn(&mut FunctionContext<'a>, &Row) + 'static,
     {
-        self.columns.push(CachedColumnDef {
-            name: name.into(),
-            column_type,
-            getter: Box::new(getter),
-            setter: None,
-        });
-        self
+        self.add_column(name, column_type, Box::new(getter), None)
     }
 
     /// Add an `INTEGER` column whose getter returns an `i32` for a row.
@@ -353,9 +571,12 @@ impl<Row: 'static> CachedTableBuilder<Row> {
     where
         F: Fn(&Row) -> i32 + 'static,
     {
-        self.column(name, ColumnType::Integer, move |ctx, row| {
-            ctx.result_int(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::row_getter_int(getter),
+            None,
+        )
     }
 
     /// Add an `INTEGER` column whose getter returns an `i64` for a row.
@@ -363,9 +584,12 @@ impl<Row: 'static> CachedTableBuilder<Row> {
     where
         F: Fn(&Row) -> i64 + 'static,
     {
-        self.column(name, ColumnType::Integer, move |ctx, row| {
-            ctx.result_i64(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::row_getter_i64(getter),
+            None,
+        )
     }
 
     /// Alias for [`column_i64`](Self::column_i64).
@@ -381,9 +605,12 @@ impl<Row: 'static> CachedTableBuilder<Row> {
     where
         F: Fn(&Row) -> String + 'static,
     {
-        self.column(name, ColumnType::Text, move |ctx, row| {
-            ctx.result_text(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Text,
+            column_helpers::row_getter_text(getter),
+            None,
+        )
     }
 
     /// Add a `REAL` column whose getter returns an `f64` for a row.
@@ -391,9 +618,12 @@ impl<Row: 'static> CachedTableBuilder<Row> {
     where
         F: Fn(&Row) -> f64 + 'static,
     {
-        self.column(name, ColumnType::Real, move |ctx, row| {
-            ctx.result_double(getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Real,
+            column_helpers::row_getter_double(getter),
+            None,
+        )
     }
 
     /// Add a `BLOB` column whose getter returns a `Vec<u8>` for a row.
@@ -401,15 +631,48 @@ impl<Row: 'static> CachedTableBuilder<Row> {
     where
         F: Fn(&Row) -> Vec<u8> + 'static,
     {
-        self.column(name, ColumnType::Blob, move |ctx, row| {
-            ctx.result_blob(&getter(row));
-        })
+        self.add_column(
+            name,
+            ColumnType::Blob,
+            column_helpers::row_getter_blob(getter),
+            None,
+        )
+    }
+
+    /// Add a read-only `INTEGER` (`i32`) column whose getter may return `None`
+    /// (emitting SQL NULL). Read-only sibling of
+    /// [`column_int_nullable_rw`](Self::column_int_nullable_rw) (getter only).
+    pub fn column_int_nullable<F>(self, name: impl Into<String>, getter: F) -> Self
+    where
+        F: Fn(&Row) -> Option<i32> + 'static,
+    {
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::row_getter_nullable_int(getter),
+            None,
+        )
+    }
+
+    /// Add a read-only `TEXT` column whose getter may return `None` (emitting
+    /// SQL NULL). Read-only sibling of
+    /// [`column_text_nullable_rw`](Self::column_text_nullable_rw) (getter only).
+    pub fn column_text_nullable<F>(self, name: impl Into<String>, getter: F) -> Self
+    where
+        F: Fn(&Row) -> Option<String> + 'static,
+    {
+        self.add_column(
+            name,
+            ColumnType::Text,
+            column_helpers::row_getter_nullable_text(getter),
+            None,
+        )
     }
 
     /// Add a writable column with a custom getter and setter operating on a row
     /// reference.
     pub fn column_rw<G, S>(
-        mut self,
+        self,
         name: impl Into<String>,
         column_type: ColumnType,
         getter: G,
@@ -419,45 +682,37 @@ impl<Row: 'static> CachedTableBuilder<Row> {
         G: for<'a> Fn(&mut FunctionContext<'a>, &Row) + 'static,
         S: for<'a> Fn(&mut Row, &FunctionArg<'a>) -> bool + 'static,
     {
-        self.columns.push(CachedColumnDef {
-            name: name.into(),
-            column_type,
-            getter: Box::new(getter),
-            setter: Some(Box::new(setter)),
-        });
-        self
+        self.add_column(name, column_type, Box::new(getter), Some(Box::new(setter)))
     }
 
     /// Add a writable `INTEGER` (`i32`) column; the setter returns false to
     /// reject the write.
-    pub fn column_int_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_int_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> i32 + 'static,
         S: Fn(&mut Row, i32) -> bool + 'static,
     {
-        self.columns.push(CachedColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Integer,
-            getter: Box::new(move |ctx, row| ctx.result_int(getter(row))),
-            setter: Some(Box::new(move |row, value| setter(row, value.as_i32()))),
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::row_getter_int(getter),
+            Some(column_helpers::row_setter_int(setter)),
+        )
     }
 
     /// Add a writable `INTEGER` (`i64`) column; the setter returns false to
     /// reject the write.
-    pub fn column_i64_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_i64_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> i64 + 'static,
         S: Fn(&mut Row, i64) -> bool + 'static,
     {
-        self.columns.push(CachedColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Integer,
-            getter: Box::new(move |ctx, row| ctx.result_i64(getter(row))),
-            setter: Some(Box::new(move |row, value| setter(row, value.as_i64()))),
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::row_getter_i64(getter),
+            Some(column_helpers::row_setter_i64(setter)),
+        )
     }
 
     /// Alias for [`column_i64_rw`](Self::column_i64_rw).
@@ -471,27 +726,23 @@ impl<Row: 'static> CachedTableBuilder<Row> {
 
     /// Add a writable `TEXT` column; the setter returns false to reject the
     /// write.
-    pub fn column_text_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_text_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> String + 'static,
         S: Fn(&mut Row, &str) -> bool + 'static,
     {
-        self.columns.push(CachedColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Text,
-            getter: Box::new(move |ctx, row| ctx.result_text(getter(row))),
-            setter: Some(Box::new(move |row, value| {
-                let text = value.as_c_str().map(CStr::to_string_lossy);
-                setter(row, text.as_deref().unwrap_or(""))
-            })),
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Text,
+            column_helpers::row_getter_text(getter),
+            Some(column_helpers::row_setter_text(setter)),
+        )
     }
 
     /// Add a writable `TEXT` column whose getter may return `None` (emitting SQL
     /// NULL); the setter receives the raw argument.
     pub fn column_text_nullable_rw<G, S>(
-        mut self,
+        self,
         name: impl Into<String>,
         getter: G,
         setter: S,
@@ -500,48 +751,60 @@ impl<Row: 'static> CachedTableBuilder<Row> {
         G: Fn(&Row) -> Option<String> + 'static,
         S: for<'a> Fn(&mut Row, &FunctionArg<'a>) -> bool + 'static,
     {
-        self.columns.push(CachedColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Text,
-            getter: Box::new(move |ctx, row| match getter(row) {
-                Some(value) => ctx.result_text(value),
-                None => ctx.result_null(),
-            }),
-            setter: Some(Box::new(setter)),
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Text,
+            column_helpers::row_getter_nullable_text(getter),
+            Some(Box::new(setter)),
+        )
+    }
+
+    /// Add a writable `INTEGER` (`i32`) column whose getter may return `None`
+    /// (emitting SQL NULL); the setter receives the raw argument. Mirrors
+    /// [`column_text_nullable_rw`](Self::column_text_nullable_rw) for the
+    /// integer type — used where a mapped-but-unknown value must read back as
+    /// NULL rather than 0.
+    pub fn column_int_nullable_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
+    where
+        G: Fn(&Row) -> Option<i32> + 'static,
+        S: for<'a> Fn(&mut Row, &FunctionArg<'a>) -> bool + 'static,
+    {
+        self.add_column(
+            name,
+            ColumnType::Integer,
+            column_helpers::row_getter_nullable_int(getter),
+            Some(Box::new(setter)),
+        )
     }
 
     /// Add a writable `REAL` column; the setter returns false to reject the
     /// write.
-    pub fn column_double_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_double_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> f64 + 'static,
         S: Fn(&mut Row, f64) -> bool + 'static,
     {
-        self.columns.push(CachedColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Real,
-            getter: Box::new(move |ctx, row| ctx.result_double(getter(row))),
-            setter: Some(Box::new(move |row, value| setter(row, value.as_f64()))),
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Real,
+            column_helpers::row_getter_double(getter),
+            Some(column_helpers::row_setter_double(setter)),
+        )
     }
 
     /// Add a writable `BLOB` column; the setter returns false to reject the
     /// write.
-    pub fn column_blob_rw<G, S>(mut self, name: impl Into<String>, getter: G, setter: S) -> Self
+    pub fn column_blob_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> Vec<u8> + 'static,
         S: Fn(&mut Row, &[u8]) -> bool + 'static,
     {
-        self.columns.push(CachedColumnDef {
-            name: name.into(),
-            column_type: ColumnType::Blob,
-            getter: Box::new(move |ctx, row| ctx.result_blob(&getter(row))),
-            setter: Some(Box::new(move |row, value| setter(row, value.as_blob()))),
-        });
-        self
+        self.add_column(
+            name,
+            ColumnType::Blob,
+            column_helpers::row_getter_blob(getter),
+            Some(column_helpers::row_setter_blob(setter)),
+        )
     }
 
     /// Register an equality-pushdown filter on `column_name` backed by a
@@ -692,6 +955,7 @@ impl<Row: 'static> CachedTableBuilder<Row> {
     pub fn build(self) -> Result<CachedTableDef<Row>> {
         if self.cache_builder.is_none()
             && self.projection_cache_builder.is_none()
+            && self.stateful_cache_builder.is_none()
             && self.row_count.is_none()
         {
             return Err(Error::Message(format!(
@@ -706,12 +970,14 @@ impl<Row: 'static> CachedTableBuilder<Row> {
                 row_count: self.row_count,
                 cache_builder: self.cache_builder,
                 projection_cache_builder: self.projection_cache_builder,
+                stateful_cache_builder: self.stateful_cache_builder,
                 columns: self.columns,
                 filters: self.filters,
                 indexes: self.indexes,
                 rowid: self.rowid,
                 before_modify: self.before_modify,
                 after_modify: self.after_modify,
+                transaction_hooks: self.transaction_hooks,
                 delete_row: self.delete_row,
                 insert_row: self.insert_row,
                 row_lookup: self.row_lookup,
@@ -750,6 +1016,22 @@ impl<Row: 'static> CachedTableBuilder<Row> {
         self
     }
 
+    fn add_column(
+        mut self,
+        name: impl Into<String>,
+        column_type: ColumnType,
+        getter: Box<CachedGetter<Row>>,
+        setter: Option<Box<CachedSetter<Row>>>,
+    ) -> Self {
+        self.columns.push(CachedColumnDef {
+            name: name.into(),
+            column_type,
+            getter,
+            setter,
+        });
+        self
+    }
+
     fn find_column(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|column| column.name == name)
     }
@@ -759,18 +1041,25 @@ impl<Row: 'static> CachedTableBuilder<Row> {
 struct CachedModuleState<Row> {
     module: ffi::sqlite3_module,
     def: Rc<CachedInner<Row>>,
+    registry: *const RefCell<WriteSurfaceRegistry>,
+    caps: WriteCaps,
 }
 
 #[repr(C)]
 struct CachedVtab<Row> {
     base: ffi::sqlite3_vtab,
     def: Rc<CachedInner<Row>>,
+    transaction: TransactionLifecycle,
+    registry: *const RefCell<WriteSurfaceRegistry>,
+    schema_name: String,
+    table_name: String,
 }
 
 #[repr(C)]
 struct CachedCursor<Row> {
     base: ffi::sqlite3_vtab_cursor,
     def: Rc<CachedInner<Row>>,
+    transaction_state: TransactionState,
     local_cache: Vec<Row>,
     current_row: usize,
     iterator: Option<Box<dyn RowIterator>>,
@@ -779,6 +1068,21 @@ struct CachedCursor<Row> {
     /// When true, `index_matches` index into `local_cache` (a non-shared rowid
     /// rebuild or a single `row_lookup` result) rather than the shared cache.
     index_into_local: bool,
+    /// When true, `index_matches` index into `cursor_index_cache` — a query-scoped
+    /// per-cursor index cache built ONCE and reused across this cursor's xFilter
+    /// calls (a JOIN's inner loop), so a query-scoped table stays fast in a JOIN
+    /// without an engine-lifetime shared cache. Mirrors C++ 1a per-cursor index.
+    index_into_cursor: bool,
+    cursor_index_cache: Vec<Row>,
+    cursor_indexes: Vec<HashMap<i64, Vec<usize>>>,
+    cursor_index_built: bool,
+    /// Parallel sorted views for range pushdown on a query-scoped table, one slot
+    /// per index, built lazily on the first range query against this cursor and
+    /// reused thereafter (like `cursor_indexes`). Dropped with the cursor. The
+    /// carved match list is stored back into `index_matches` (with
+    /// `index_into_cursor` set), reusing the existing index-match iteration.
+    /// Mirrors the C++ `CachedCursor::cursor_sorted_indexes`.
+    cursor_sorted_indexes: Vec<SortedIndex>,
     /// The rowid this cursor was opened to look up (a `CACHED_ROWID_SCAN`). The
     /// cursor returns exactly the row with this rowid, so `xRowid` reports it
     /// directly — independent of how the row was resolved (`row_lookup`, shared
@@ -789,6 +1093,7 @@ struct CachedCursor<Row> {
 
 pub(crate) fn register_cached_table<Row: 'static>(
     db: *mut ffi::sqlite3,
+    registry: *const RefCell<WriteSurfaceRegistry>,
     module_name: &str,
     def: &CachedTableDef<Row>,
 ) -> Result<()> {
@@ -799,6 +1104,8 @@ pub(crate) fn register_cached_table<Row: 'static>(
     let state = Box::new(CachedModuleState {
         module: create_cached_module::<Row>(),
         def: def.inner.clone(),
+        registry,
+        caps: def.write_caps(),
     });
     let state_ptr = Box::into_raw(state);
     let module_ptr = unsafe { &(*state_ptr).module as *const ffi::sqlite3_module };
@@ -825,7 +1132,7 @@ fn create_cached_module<Row: 'static>() -> ffi::sqlite3_module {
     module.xConnect = Some(cached_vtab_connect::<Row>);
     module.xBestIndex = Some(cached_vtab_best_index::<Row>);
     module.xDisconnect = Some(cached_vtab_disconnect::<Row>);
-    module.xDestroy = Some(cached_vtab_disconnect::<Row>);
+    module.xDestroy = Some(cached_vtab_destroy::<Row>);
     module.xOpen = Some(cached_vtab_open::<Row>);
     module.xClose = Some(cached_vtab_close::<Row>);
     module.xFilter = Some(cached_vtab_filter::<Row>);
@@ -834,6 +1141,15 @@ fn create_cached_module<Row: 'static>() -> ffi::sqlite3_module {
     module.xColumn = Some(cached_vtab_column::<Row>);
     module.xRowid = Some(cached_vtab_rowid::<Row>);
     module.xUpdate = Some(cached_vtab_update::<Row>);
+    // xBegin enrolls the vtab. Run the fallible hook in xSync, whose error
+    // SQLite propagates; xCommit only clears state because its result is ignored.
+    module.xBegin = Some(cached_vtab_begin::<Row>);
+    module.xSync = Some(cached_vtab_sync::<Row>);
+    module.xCommit = Some(cached_vtab_commit::<Row>);
+    module.xRollback = Some(cached_vtab_rollback::<Row>);
+    module.xSavepoint = Some(cached_vtab_savepoint::<Row>);
+    module.xRelease = Some(cached_vtab_release::<Row>);
+    module.xRollbackTo = Some(cached_vtab_rollback_to::<Row>);
     module
 }
 
@@ -848,8 +1164,8 @@ unsafe extern "C" fn destroy_cached_module_state<Row>(ptr: *mut c_void) {
 unsafe extern "C" fn cached_vtab_connect<Row>(
     db: *mut ffi::sqlite3,
     p_aux: *mut c_void,
-    _argc: c_int,
-    _argv: *const *const c_char,
+    argc: c_int,
+    argv: *const *const c_char,
     pp_vtab: *mut *mut ffi::sqlite3_vtab,
     pz_err: *mut *mut c_char,
 ) -> c_int {
@@ -864,14 +1180,32 @@ unsafe extern "C" fn cached_vtab_connect<Row>(
             if !sqlite_ok(rc) {
                 return Err(Error::sqlite(rc, crate::function::sqlite_error(db)));
             }
+            let transaction = TransactionLifecycle::new(&state.def.transaction_hooks)?;
+            let (schema_name, table_name) =
+                connect_write_surface(state.registry, argc, argv, state.caps.clone())?;
             let vtab = Box::new(CachedVtab {
                 base: std::mem::zeroed(),
                 def: state.def.clone(),
+                transaction,
+                registry: state.registry,
+                schema_name,
+                table_name,
             });
             let vtab_ptr = Box::into_raw(vtab);
             *pp_vtab = &mut (*vtab_ptr).base;
             Ok(ffi::SQLITE_OK)
         })
+    }
+}
+
+unsafe extern "C" fn cached_vtab_destroy<Row>(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if !p_vtab.is_null() {
+            let vtab = Box::from_raw(p_vtab.cast::<CachedVtab<Row>>());
+            destroy_write_surface(vtab.registry, &vtab.schema_name, &vtab.table_name);
+            drop(vtab);
+        }
+        ffi::SQLITE_OK
     }
 }
 
@@ -897,12 +1231,18 @@ unsafe extern "C" fn cached_vtab_open<Row>(
             let cursor = Box::new(CachedCursor {
                 base: std::mem::zeroed(),
                 def: vtab.def.clone(),
+                transaction_state: vtab.transaction.state(),
                 local_cache: Vec::new(),
                 current_row: 0,
                 iterator: None,
                 iterator_eof: false,
                 index_matches: None,
                 index_into_local: false,
+                index_into_cursor: false,
+                cursor_index_cache: Vec::new(),
+                cursor_indexes: Vec::new(),
+                cursor_index_built: false,
+                cursor_sorted_indexes: Vec::new(),
                 rowid_lookup_id: None,
                 count_only_total: None,
             });
@@ -923,7 +1263,7 @@ unsafe extern "C" fn cached_vtab_close<Row>(cursor: *mut ffi::sqlite3_vtab_curso
     }
 }
 
-unsafe extern "C" fn cached_vtab_filter<Row>(
+unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
     cursor: *mut ffi::sqlite3_vtab_cursor,
     idx_num: c_int,
     idx_str: *const c_char,
@@ -942,8 +1282,12 @@ unsafe extern "C" fn cached_vtab_filter<Row>(
             cursor.iterator_eof = false;
             cursor.index_matches = None;
             cursor.index_into_local = false;
+            cursor.index_into_cursor = false; // cursor_index_* persist (build-once)
             cursor.rowid_lookup_id = None;
             cursor.count_only_total = None;
+            // A new scan begins a new statement: drop any query-scoped mutation
+            // snapshot preserved from a prior scan-driven UPDATE/DELETE.
+            cursor.def.clear_query_scoped_mutation_snapshot();
 
             if idx_num == CACHED_COUNT_ONLY_SCAN {
                 cursor.count_only_total = Some(
@@ -964,7 +1308,7 @@ unsafe extern "C" fn cached_vtab_filter<Row>(
                 cursor.rowid_lookup_id = Some(target_rowid);
                 // C++ parity: resolve a rowid lookup through `row_lookup` first when
                 // present (a single-row result, no cache build, and able to find rows
-                // outside the cache). See vtable.hpp:1485-1527.
+                // outside the cache). See the reference planner's equivalent path.
                 if let Some(row_lookup) = cursor.def.row_lookup.as_ref()
                     && let Some(row) = row_lookup(target_rowid)
                 {
@@ -985,7 +1329,11 @@ unsafe extern "C" fn cached_vtab_filter<Row>(
                         Some(cached_rowid_matches(&cursor.def, &cache.data, target_rowid));
                 } else {
                     let def = cursor.def.clone();
-                    def.build_rows(&mut cursor.local_cache, parse_col_used(idx_str));
+                    def.build_rows(
+                        &cursor.transaction_state,
+                        &mut cursor.local_cache,
+                        parse_col_used(idx_str),
+                    );
                     cursor.index_matches = Some(cached_rowid_matches(
                         &def,
                         &cursor.local_cache,
@@ -996,18 +1344,155 @@ unsafe extern "C" fn cached_vtab_filter<Row>(
                 return Ok(());
             }
 
+            // Range (>=, >, <=, <, BETWEEN) plan on an indexed column. The range
+            // base sits above CACHED_INDEX_BASE, so this must be tested BEFORE the
+            // equality-index branch below. The sorted view is built lazily here
+            // and cached (shared cache for shared tables, per-cursor otherwise).
+            if let Some((index_pos, range_flags)) = decode_range_idx(idx_num) {
+                let index_defs = &cursor.def.indexes;
+                if index_pos < index_defs.len() {
+                    // Decode bounds from argv: low first (if present), then high.
+                    let mut arg = 0isize;
+                    let mut low = 0i64;
+                    let mut high = 0i64;
+                    if range_flags & RANGE_HAS_LOW != 0 {
+                        if (arg as c_int) < argc {
+                            low = FunctionArg::new(*argv.offset(arg)).as_i64();
+                        }
+                        arg += 1;
+                    }
+                    if range_flags & RANGE_HAS_HIGH != 0 {
+                        if (arg as c_int) < argc {
+                            high = FunctionArg::new(*argv.offset(arg)).as_i64();
+                        }
+                        arg += 1;
+                    }
+                    let _ = arg;
+                    if cursor.def.use_shared_cache {
+                        cursor.def.ensure_shared_cache();
+                        let mut cache = cursor.def.shared_cache.borrow_mut();
+                        if cache.built && index_pos < cache.sorted_indexes.len() {
+                            if !cache.sorted_indexes[index_pos].built {
+                                // Build into a fresh view (reads `data`), then move
+                                // it into the slot — avoids overlapping borrows.
+                                let mut sorted = SortedIndex::default();
+                                sorted.build(&cache.data, &index_defs[index_pos].key);
+                                cache.sorted_indexes[index_pos] = sorted;
+                            }
+                            let mut matches = Vec::new();
+                            cache.sorted_indexes[index_pos].collect_matches(
+                                range_flags,
+                                low,
+                                high,
+                                &mut matches,
+                            );
+                            cursor.index_matches = Some(matches);
+                        } else {
+                            cursor.index_matches = Some(Vec::new());
+                        }
+                        return Ok(());
+                    } else if cursor.def.has_cache_builder() {
+                        // Query-scoped: build the per-cursor cache once (reused
+                        // across this cursor's xFilter calls), then the sorted
+                        // view on demand.
+                        if !cursor.cursor_index_built {
+                            let def = cursor.def.clone();
+                            def.build_rows(
+                                &cursor.transaction_state,
+                                &mut cursor.cursor_index_cache,
+                                u64::MAX,
+                            );
+                            cursor.cursor_indexes = def
+                                .indexes
+                                .iter()
+                                .map(|index| {
+                                    let mut map: HashMap<i64, Vec<usize>> = HashMap::new();
+                                    for (row_index, row) in
+                                        cursor.cursor_index_cache.iter().enumerate()
+                                    {
+                                        map.entry((index.key)(row)).or_default().push(row_index);
+                                    }
+                                    map
+                                })
+                                .collect();
+                            cursor.cursor_index_built = true;
+                        }
+                        if cursor.cursor_sorted_indexes.len() != index_defs.len() {
+                            cursor.cursor_sorted_indexes.clear();
+                            cursor
+                                .cursor_sorted_indexes
+                                .resize_with(index_defs.len(), SortedIndex::default);
+                        }
+                        if !cursor.cursor_sorted_indexes[index_pos].built {
+                            cursor.cursor_sorted_indexes[index_pos]
+                                .build(&cursor.cursor_index_cache, &index_defs[index_pos].key);
+                        }
+                        let mut matches = Vec::new();
+                        cursor.cursor_sorted_indexes[index_pos].collect_matches(
+                            range_flags,
+                            low,
+                            high,
+                            &mut matches,
+                        );
+                        cursor.index_matches = Some(matches);
+                        cursor.index_into_cursor = true;
+                        return Ok(());
+                    }
+                }
+                // Not resolvable as a range plan; fall through to a full scan below.
+            }
+
             if idx_num >= CACHED_INDEX_BASE && argc > 0 {
                 let index_pos = (idx_num - CACHED_INDEX_BASE) as usize;
-                cursor.def.ensure_shared_cache();
                 let key = FunctionArg::new(*argv).as_i64();
-                let cache = cursor.def.shared_cache.borrow();
-                let matches = cache
-                    .indexes
-                    .get(index_pos)
-                    .and_then(|index| index.get(&key))
-                    .cloned()
-                    .unwrap_or_default();
-                cursor.index_matches = Some(matches);
+                if cursor.def.use_shared_cache {
+                    cursor.def.ensure_shared_cache();
+                    let cache = cursor.def.shared_cache.borrow();
+                    // Own the matched positions rather than referencing the shared
+                    // cache: the borrow is released when xFilter returns, and a
+                    // mutation may rebuild the cache before the scan reads them, so a
+                    // borrowed reference would go stale. The clone keeps this scan's
+                    // snapshot consistent.
+                    let matches = cache
+                        .indexes
+                        .get(index_pos)
+                        .and_then(|index| index.get(&key))
+                        .cloned()
+                        .unwrap_or_default();
+                    cursor.index_matches = Some(matches);
+                } else {
+                    // Query-scoped: build the per-cursor cache + hash indexes ONCE,
+                    // then reuse across this cursor's xFilter calls (JOIN inner loop).
+                    if !cursor.cursor_index_built {
+                        let def = cursor.def.clone();
+                        def.build_rows(
+                            &cursor.transaction_state,
+                            &mut cursor.cursor_index_cache,
+                            u64::MAX,
+                        );
+                        cursor.cursor_indexes = def
+                            .indexes
+                            .iter()
+                            .map(|index| {
+                                let mut map: HashMap<i64, Vec<usize>> = HashMap::new();
+                                for (row_index, row) in cursor.cursor_index_cache.iter().enumerate()
+                                {
+                                    map.entry((index.key)(row)).or_default().push(row_index);
+                                }
+                                map
+                            })
+                            .collect();
+                        cursor.cursor_index_built = true;
+                    }
+                    let matches = cursor
+                        .cursor_indexes
+                        .get(index_pos)
+                        .and_then(|index| index.get(&key))
+                        .cloned()
+                        .unwrap_or_default();
+                    cursor.index_matches = Some(matches);
+                    cursor.index_into_cursor = true;
+                }
                 return Ok(());
             }
 
@@ -1026,7 +1511,11 @@ unsafe extern "C" fn cached_vtab_filter<Row>(
                 cursor.def.ensure_shared_cache();
             } else {
                 let def = cursor.def.clone();
-                def.build_rows(&mut cursor.local_cache, parse_col_used(idx_str));
+                def.build_rows(
+                    &cursor.transaction_state,
+                    &mut cursor.local_cache,
+                    parse_col_used(idx_str),
+                );
             }
             Ok(())
         }));
@@ -1094,7 +1583,8 @@ unsafe extern "C" fn cached_vtab_column<Row>(
             if sqlite3_vtab_nochange(ctx) != 0
                 && !cursor.def.update_from_column_values
                 && ((cursor.def.rowid.is_none() && cursor.def.use_shared_cache)
-                    || cursor.def.row_lookup.is_some())
+                    || cursor.def.row_lookup.is_some()
+                    || cursor.def.query_scoped_uses_mutation_snapshot())
             {
                 return Ok(());
             }
@@ -1203,14 +1693,28 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
             let old_rowid = FunctionArg::new(*argv);
             if argc == 1 && !old_rowid.is_null() {
                 let Some(delete_row) = vtab.def.delete_row.as_ref() else {
-                    return Ok(ffi::SQLITE_READONLY);
+                    return Ok(unsupported_delete(p_vtab, &vtab.def.name));
                 };
                 let operation = format!("DELETE FROM {}", vtab.def.name);
+                // Snapshot before the before_modify hook: a failed snapshot
+                // aborts the statement before any observable side effect (e.g.
+                // an undo point). Idempotent — the reconstruct helper's own
+                // call becomes a no-op.
+                let transaction_state = vtab.transaction.state();
+                vtab.def
+                    .ensure_query_scoped_mutation_snapshot(&transaction_state)?;
+                vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
-                let deleted = cached_delete_reconstruct(&vtab.def, old_rowid.as_i64(), delete_row)?;
+                let deleted = cached_delete_reconstruct(
+                    &vtab.def,
+                    &transaction_state,
+                    old_rowid.as_i64(),
+                    delete_row,
+                )?;
                 if deleted {
                     vtab.def.invalidate_shared_cache();
                     call_cached_modify_hook(&vtab.def.after_modify, &operation);
+                    vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
                 return Err(Error::Message("cached table delete failed".to_string()));
@@ -1223,17 +1727,27 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
                     .iter()
                     .any(|column| column.setter.is_some())
                 {
-                    return Ok(ffi::SQLITE_READONLY);
+                    return Ok(unsupported_update(p_vtab, &vtab.def.name));
                 }
                 let args = build_args(argc - 2, argv.add(2));
                 let operation = format!("UPDATE {}", vtab.def.name);
+                // Snapshot before the before_modify hook — see the DELETE arm.
+                let transaction_state = vtab.transaction.state();
+                vtab.def
+                    .ensure_query_scoped_mutation_snapshot(&transaction_state)?;
+                vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
 
-                let updated =
-                    cached_update_reconstruct_and_apply(&vtab.def, old_rowid.as_i64(), &args)?;
+                let updated = cached_update_reconstruct_and_apply(
+                    &vtab.def,
+                    &transaction_state,
+                    old_rowid.as_i64(),
+                    &args,
+                )?;
                 if updated {
                     vtab.def.invalidate_shared_cache();
                     call_cached_modify_hook(&vtab.def.after_modify, &operation);
+                    vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
                 // No reconstruction branch resolved the row (e.g. a stable rowid_fn on
@@ -1243,9 +1757,10 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
 
             if argc > 1 && old_rowid.is_null() {
                 let Some(insert_row) = vtab.def.insert_row.as_ref() else {
-                    return Ok(ffi::SQLITE_READONLY);
+                    return Ok(unsupported_insert(p_vtab, &vtab.def.name));
                 };
                 let operation = format!("INSERT INTO {}", vtab.def.name);
+                vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
                 let args = build_args(argc - 2, argv.add(2));
                 if insert_row(&args) {
@@ -1254,6 +1769,7 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
                     }
                     vtab.def.clear_shared_cache();
                     call_cached_modify_hook(&vtab.def.after_modify, &operation);
+                    vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
                 return Err(Error::Message("cached table insert failed".to_string()));
@@ -1272,6 +1788,98 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
                 ffi::SQLITE_ERROR
             }
         }
+    }
+}
+
+unsafe extern "C" fn cached_vtab_begin<Row>(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if let Some(vtab) = p_vtab.cast::<CachedVtab<Row>>().as_ref() {
+            vtab.transaction.begin();
+        }
+        ffi::SQLITE_OK
+    }
+}
+
+unsafe extern "C" fn cached_vtab_sync<Row>(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<CachedVtab<Row>>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql cached vtab is null".to_string()))?;
+            vtab.transaction.sync(&vtab.def.transaction_hooks)
+        }));
+        finish_vtab_unit(p_vtab, result)
+    }
+}
+
+unsafe extern "C" fn cached_vtab_commit<Row>(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if let Some(vtab) = p_vtab.cast::<CachedVtab<Row>>().as_ref() {
+            // SQLite ignores xCommit/xRollback errors. Contain a panic without
+            // leaving an ignored allocation in zErrMsg.
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                vtab.transaction.commit(&vtab.def.transaction_hooks);
+            }));
+        }
+        ffi::SQLITE_OK
+    }
+}
+
+unsafe extern "C" fn cached_vtab_rollback<Row>(p_vtab: *mut ffi::sqlite3_vtab) -> c_int {
+    unsafe {
+        if let Some(vtab) = p_vtab.cast::<CachedVtab<Row>>().as_ref() {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                vtab.transaction.rollback(&vtab.def.transaction_hooks);
+            }));
+        }
+        ffi::SQLITE_OK
+    }
+}
+
+unsafe extern "C" fn cached_vtab_savepoint<Row>(
+    p_vtab: *mut ffi::sqlite3_vtab,
+    id: c_int,
+) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<CachedVtab<Row>>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql cached vtab is null".to_string()))?;
+            vtab.transaction.savepoint(&vtab.def.transaction_hooks, id)
+        }));
+        finish_vtab_unit(p_vtab, result)
+    }
+}
+
+unsafe extern "C" fn cached_vtab_release<Row>(p_vtab: *mut ffi::sqlite3_vtab, id: c_int) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<CachedVtab<Row>>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql cached vtab is null".to_string()))?;
+            vtab.transaction.release(&vtab.def.transaction_hooks, id)
+        }));
+        finish_vtab_unit(p_vtab, result)
+    }
+}
+
+unsafe extern "C" fn cached_vtab_rollback_to<Row>(
+    p_vtab: *mut ffi::sqlite3_vtab,
+    id: c_int,
+) -> c_int {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let vtab = p_vtab
+                .cast::<CachedVtab<Row>>()
+                .as_ref()
+                .ok_or_else(|| Error::Message("xsql cached vtab is null".to_string()))?;
+            vtab.transaction
+                .rollback_to(&vtab.def.transaction_hooks, id)
+        }));
+        finish_vtab_unit(p_vtab, result)
     }
 }
 
@@ -1300,10 +1908,25 @@ unsafe extern "C" fn cached_vtab_best_index<Row>(
             let mut best_index_pos: Option<usize> = None;
             let mut best_index_constraint = -1;
             let mut best_rowid_constraint = -1;
-            // Cost-tracked selection mirroring the C++ planner: filters and the hash
-            // index compete by cost, and the index (cost 1.0) wins only when strictly
-            // cheaper than the best filter (clearing it). See vtable.hpp:1628-1694.
+            // Cost-tracked filter selection mirroring the C++ planner; the hash
+            // index is tracked independently and ranked against the best filter at
+            // plan selection (shared cache: index wins; query-scoped: filter wins).
             let mut best_cost = 1.0e9_f64;
+
+            // Range-pushdown candidate: the lower/upper bound constraints that
+            // target a single indexed column. SQLite delivers `x BETWEEN a AND b`
+            // as a GE + an LE constraint on the same column, so a lower and an
+            // upper bound on the SAME indexed column are consumed together (two
+            // argv slots). A range plan is only chosen when NO equality
+            // index/filter won (equality is strictly cheaper). A range is only
+            // served off a sorted view, which needs the cache: shared tables or
+            // query-scoped tables with a cache_builder.
+            let range_eligible = vtab.def.use_shared_cache || vtab.def.has_cache_builder();
+            let mut range_index_pos: Option<usize> = None;
+            let mut range_low_constraint = -1;
+            let mut range_high_constraint = -1;
+            let mut range_low_strict = false; // GT (>) vs GE (>=)
+            let mut range_high_strict = false; // LT (<) vs LE (<=)
 
             for i in 0..info.nConstraint {
                 let constraint = &*info.aConstraint.add(i as usize);
@@ -1314,6 +1937,31 @@ unsafe extern "C" fn cached_vtab_best_index<Row>(
                 let is_eq = op == ffi::SQLITE_INDEX_CONSTRAINT_EQ;
                 let is_like = op == ffi::SQLITE_INDEX_CONSTRAINT_LIKE
                     || op == ffi::SQLITE_INDEX_CONSTRAINT_GLOB;
+                let is_low =
+                    op == ffi::SQLITE_INDEX_CONSTRAINT_GE || op == ffi::SQLITE_INDEX_CONSTRAINT_GT;
+                let is_high =
+                    op == ffi::SQLITE_INDEX_CONSTRAINT_LE || op == ffi::SQLITE_INDEX_CONSTRAINT_LT;
+
+                // Range (>=, >, <=, <) on an indexed column: record the tightest
+                // bound(s) for a single indexed column. Only pursued if no
+                // equality lookup wins (chosen at plan selection below).
+                if (is_low || is_high) && range_eligible && constraint.iColumn >= 0 {
+                    let column_index = constraint.iColumn as usize;
+                    if let Some(idx_pos) = vtab.def.find_index_by_column(column_index)
+                        && range_index_pos.is_none_or(|pos| pos == idx_pos)
+                    {
+                        range_index_pos = Some(idx_pos);
+                        if is_low && range_low_constraint < 0 {
+                            range_low_constraint = i;
+                            range_low_strict = op == ffi::SQLITE_INDEX_CONSTRAINT_GT;
+                        } else if is_high && range_high_constraint < 0 {
+                            range_high_constraint = i;
+                            range_high_strict = op == ffi::SQLITE_INDEX_CONSTRAINT_LT;
+                        }
+                    }
+                    continue;
+                }
+
                 if !is_eq && !is_like {
                     continue;
                 }
@@ -1339,24 +1987,36 @@ unsafe extern "C" fn cached_vtab_best_index<Row>(
                     best_filter_constraint = i;
                     best_cost = filter.estimated_cost;
                 }
-                // Shared-cache hash index (equality only). Index lookups are cheap
-                // (cost 1.0); take it only when strictly cheaper than the best filter,
-                // and clear the filter when the index wins.
+                // Hash index (equality only). Query-scoped tables also use it:
+                // xFilter builds the hash index on a per-cursor cache (needs a
+                // cache_builder to (re)build).
                 if is_eq
-                    && vtab.def.use_shared_cache
+                    && (vtab.def.use_shared_cache || vtab.def.has_cache_builder())
                     && let Some(index_pos) = vtab.def.find_index_by_column(column_index)
                 {
-                    let index_cost = 1.0;
-                    if index_cost < best_cost {
+                    if vtab.def.use_shared_cache {
+                        // Hash lookup on the already-built shared cache is
+                        // near-free: compete by cost, displacing a costlier filter.
+                        let index_cost = 1.0;
+                        if index_cost < best_cost {
+                            best_index_pos = Some(index_pos);
+                            best_index_constraint = i;
+                            best_cost = index_cost;
+                            best_filter = None;
+                        }
+                    } else if best_index_pos.is_none() {
+                        // Query-scoped: the index scan must first BUILD the
+                        // per-cursor cache (a full engine read), so it never
+                        // outranks an explicit filter (a targeted engine read).
+                        // Recorded as the fallback that beats a full scan; chosen
+                        // below only when no filter matched.
                         best_index_pos = Some(index_pos);
                         best_index_constraint = i;
-                        best_cost = index_cost;
-                        best_filter = None;
                     }
                 }
             }
 
-            // Plan selection priority mirrors the C++ planner (vtable.hpp:1697-1732):
+            // Plan selection priority mirrors the reference planner:
             // count-only -> rowid -> hash index -> explicit filter -> full scan. The
             // full-scan/count-only estimate uses estimate_rows (default 1000).
             let estimated_rows = vtab
@@ -1369,6 +2029,7 @@ unsafe extern "C" fn cached_vtab_best_index<Row>(
             if info.nConstraint == 0
                 && info.colUsed == 0
                 && vtab.def.row_count.is_some()
+                && vtab.def.rowid.is_none()
                 && !vtab.def.has_scan_driven_mutation()
             {
                 info.idxNum = CACHED_COUNT_ONLY_SCAN;
@@ -1387,7 +2048,9 @@ unsafe extern "C" fn cached_vtab_best_index<Row>(
                 return Ok(());
             }
 
-            if let Some(index_pos) = best_index_pos {
+            if let Some(index_pos) = best_index_pos
+                && best_filter.is_none()
+            {
                 let usage = &mut *info.aConstraintUsage.add(best_index_constraint as usize);
                 usage.argvIndex = 1;
                 usage.omit = 1;
@@ -1407,6 +2070,61 @@ unsafe extern "C" fn cached_vtab_best_index<Row>(
                 return Ok(());
             }
 
+            // Range plan on an indexed column: cheaper than a full scan (a
+            // sorted-view window), pricier than an EQ point lookup. A two-bound
+            // (BETWEEN) window is tighter than a one-bound half-scan, so it costs
+            // less. The bounds are handled EXACTLY by the sorted-view carve
+            // (strict/inclusive honored), so the consumed constraints are omitted
+            // (SQLite need not re-check them). argv order is [low?, high?].
+            if let Some(index_pos) = range_index_pos
+                && (range_low_constraint >= 0 || range_high_constraint >= 0)
+            {
+                let mut range_flags = 0;
+                let mut argv_slot = 1;
+                if range_low_constraint >= 0 {
+                    range_flags |= RANGE_HAS_LOW;
+                    if range_low_strict {
+                        range_flags |= RANGE_LOW_STRICT;
+                    }
+                    let usage = &mut *info.aConstraintUsage.add(range_low_constraint as usize);
+                    usage.argvIndex = argv_slot;
+                    usage.omit = 1;
+                    argv_slot += 1;
+                }
+                if range_high_constraint >= 0 {
+                    range_flags |= RANGE_HAS_HIGH;
+                    if range_high_strict {
+                        range_flags |= RANGE_HIGH_STRICT;
+                    }
+                    let usage = &mut *info.aConstraintUsage.add(range_high_constraint as usize);
+                    usage.argvIndex = argv_slot;
+                    usage.omit = 1;
+                }
+                let two_bound = range_low_constraint >= 0 && range_high_constraint >= 0;
+                // Fraction-of-scan heuristic: a two-sided window is assumed to
+                // select ~1/4 of rows, a one-sided ~1/2. Always strictly below the
+                // full-scan cost so a pushed range beats the scan, and above the EQ
+                // cost of 1.0.
+                let frac = if two_bound { 0.25 } else { 0.5 };
+                let full_cost = estimated_rows as f64;
+                let mut range_cost = 2.0 + full_cost * frac;
+                // Keep the range strictly cheaper than a full scan even on tiny
+                // tables so the planner prefers the pushed window (and reports a
+                // virtual index, not INDEX 0). Never dip to/below the EQ cost (1.0).
+                if range_cost >= full_cost {
+                    range_cost = 1.5_f64.max(full_cost * 0.75);
+                }
+                info.idxNum =
+                    CACHED_RANGE_BASE + index_pos as c_int * CACHED_RANGE_STRIDE + range_flags;
+                info.estimatedCost = range_cost;
+                info.estimatedRows = if estimated_rows > 0 {
+                    (estimated_rows as f64 * frac) as i64 + 1
+                } else {
+                    1
+                };
+                return Ok(());
+            }
+
             info.idxNum = FILTER_NONE;
             info.estimatedCost = estimated_rows as f64;
             info.estimatedRows = estimated_rows;
@@ -1420,8 +2138,12 @@ impl<Row> CachedCursor<Row> {
     fn with_current_row<T>(&self, f: impl FnOnce(&Row) -> T) -> Option<T> {
         if let Some(matches) = self.index_matches.as_ref() {
             let row_index = *matches.get(self.current_row)?;
-            // index_matches index into the local cache for a non-shared rebuild or
-            // a single row_lookup result, otherwise into the shared cache.
+            // index_matches index into the per-cursor index cache (query-scoped
+            // JOIN), the local cache (non-shared rebuild / single row_lookup), or
+            // otherwise the shared cache.
+            if self.index_into_cursor {
+                return self.cursor_index_cache.get(row_index).map(f);
+            }
             if self.index_into_local {
                 return self.local_cache.get(row_index).map(f);
             }
@@ -1440,24 +2162,50 @@ impl<Row> CachedCursor<Row> {
 /// Non-shared positional rebuild for UPDATE/DELETE reconstruction: for a
 /// `no_shared_cache` table without a stable `rowid_fn`, the full-scan rowid IS
 /// the row's index in a freshly rebuilt cache, so rebuild and return that row.
-/// Mirrors the C++ position-based rebuild fallback (vtable.hpp:1771 / :1859).
-fn cached_rebuilt_positional_row<Row>(def: &CachedInner<Row>, old_rowid: i64) -> Option<Row> {
-    if def.use_shared_cache || def.rowid.is_some() || def.cache_builder.is_none() {
+/// Mirrors the reference position-based rebuild fallback.
+fn cached_rebuilt_positional_row<Row>(
+    def: &CachedInner<Row>,
+    state: &TransactionState,
+    old_rowid: i64,
+) -> Option<Row> {
+    if def.use_shared_cache
+        || def.rowid.is_some()
+        || (def.cache_builder.is_none()
+            && def.projection_cache_builder.is_none()
+            && def.stateful_cache_builder.is_none())
+    {
         return None;
     }
     let index = usize::try_from(old_rowid).ok()?;
     let mut rows = Vec::new();
-    def.build_rows(&mut rows, u64::MAX);
+    def.build_rows(state, &mut rows, u64::MAX);
     rows.into_iter().nth(index)
 }
 
 /// A row can be resolved from the rowid alone — a positional shared cache (no
 /// stable `rowid_fn`) or a resolving `row_lookup`, and not opted into argv
 /// reconstruction. MUST match the cached `xColumn` NOCHANGE gate. Mirrors the C++
-/// `reconstruct_by_rowid` predicate (vtable.hpp:1759 / :1831).
+/// `reconstruct_by_rowid` predicate in the reference implementation.
 fn cached_reconstruct_by_rowid<Row>(def: &CachedInner<Row>) -> bool {
     !def.update_from_column_values
-        && ((def.rowid.is_none() && def.use_shared_cache) || def.row_lookup.is_some())
+        && ((def.rowid.is_none() && def.use_shared_cache)
+            || def.row_lookup.is_some()
+            || def.query_scoped_uses_mutation_snapshot())
+}
+
+/// Resolve a query-scoped mutation-snapshot row positionally by `old_rowid`. Only
+/// a frozen snapshot qualifies; the rowid must be in range. Mirrors the C++
+/// `!use_shared_cache && shared->mutation_snapshot` reconstruction branch.
+fn cached_query_scoped_snapshot_index<Row>(
+    def: &CachedInner<Row>,
+    old_rowid: i64,
+) -> Option<usize> {
+    if def.use_shared_cache || !def.query_scoped_uses_mutation_snapshot() {
+        return None;
+    }
+    let index = usize::try_from(old_rowid).ok()?;
+    let cache = def.shared_cache.borrow();
+    (cache.mutation_snapshot && index < cache.data.len()).then_some(index)
 }
 
 /// Resolve a shared-cache row positionally by `old_rowid` — valid only for a
@@ -1471,13 +2219,16 @@ fn cached_shared_positional_index<Row>(def: &CachedInner<Row>, old_rowid: i64) -
 }
 
 /// UPDATE row reconstruction, faithfully mirroring the C++ decision tree
-/// (vtable.hpp:1820-1909). Applies non-NOCHANGE writable setters to the resolved
+/// Applies non-NOCHANGE writable setters to the resolved
 /// row; returns false when no branch resolves (caller maps that to read-only).
 fn cached_update_reconstruct_and_apply<'a, Row>(
     def: &CachedInner<Row>,
+    state: &TransactionState,
     old_rowid: i64,
     args: &[FunctionArg<'a>],
 ) -> Result<bool> {
+    // Query-scoped tables: freeze the pre-mutation cache for this statement.
+    def.ensure_query_scoped_mutation_snapshot(state)?;
     let by_rowid = cached_reconstruct_by_rowid(def);
 
     // Branches 1 & 2: positional shared cache (no rowid_fn), mutated in place.
@@ -1507,9 +2258,17 @@ fn cached_update_reconstruct_and_apply<'a, Row>(
         return Ok(true);
     }
 
+    // Branch 4b: query-scoped mutation snapshot (positional, frozen for the
+    // statement) — used instead of a rebuild-on-mutated-data for a multi-row UPDATE.
+    if let Some(index) = cached_query_scoped_snapshot_index(def, old_rowid) {
+        let mut cache = def.shared_cache.borrow_mut();
+        apply_cached_setters(def, &mut cache.data[index], args)?;
+        return Ok(true);
+    }
+
     // Branch 5: non-shared positional rebuild.
     if !def.update_from_column_values
-        && let Some(mut row) = cached_rebuilt_positional_row(def, old_rowid)
+        && let Some(mut row) = cached_rebuilt_positional_row(def, state, old_rowid)
     {
         apply_cached_setters(def, &mut row, args)?;
         return Ok(true);
@@ -1530,13 +2289,16 @@ fn cached_update_reconstruct_and_apply<'a, Row>(
     Ok(false)
 }
 
-/// DELETE row reconstruction, mirroring the C++ tree (vtable.hpp:1748-1799):
+/// DELETE row reconstruction, mirroring the reference decision tree:
 /// positional shared -> row_lookup (ungated) -> non-shared positional rebuild.
 fn cached_delete_reconstruct<Row>(
     def: &CachedInner<Row>,
+    state: &TransactionState,
     old_rowid: i64,
     delete_row: &CachedDelete<Row>,
 ) -> Result<bool> {
+    // Query-scoped tables: freeze the pre-mutation cache for this statement.
+    def.ensure_query_scoped_mutation_snapshot(state)?;
     let by_rowid = cached_reconstruct_by_rowid(def);
 
     // Branches 1 & 2: positional shared cache (no rowid_fn). Only an already
@@ -1555,8 +2317,14 @@ fn cached_delete_reconstruct<Row>(
         return Ok(delete_row(&row));
     }
 
+    // Branch 3b: query-scoped mutation snapshot (positional, frozen for the statement).
+    if let Some(index) = cached_query_scoped_snapshot_index(def, old_rowid) {
+        let cache = def.shared_cache.borrow();
+        return Ok(delete_row(&cache.data[index]));
+    }
+
     // Branch 4: non-shared positional rebuild.
-    if let Some(row) = cached_rebuilt_positional_row(def, old_rowid) {
+    if let Some(row) = cached_rebuilt_positional_row(def, state, old_rowid) {
         return Ok(delete_row(&row));
     }
 
@@ -1595,21 +2363,19 @@ fn apply_cached_setters<'a, Row>(
     row: &mut Row,
     args: &[FunctionArg<'a>],
 ) -> Result<()> {
-    for (column_index, value) in args.iter().enumerate() {
-        if value.is_nochange() {
-            continue;
-        }
-        let Some(column) = def.columns.get(column_index) else {
-            break;
-        };
-        if let Some(setter) = column.setter.as_ref()
-            && !setter(row, value)
-        {
-            return Err(Error::Message(format!(
-                "cached table update failed for column '{}'",
-                column.name
-            )));
-        }
-    }
-    Ok(())
+    // NOCHANGE-eligible only when a row resolves from its rowid (the xColumn gate);
+    // argv-reconstruct tables carry read-only identity columns as real values.
+    apply_update_columns(
+        args,
+        def.columns.len(),
+        cached_reconstruct_by_rowid(def),
+        |i| def.columns[i].setter.is_some(),
+        |i| def.columns[i].name.clone(),
+        |i, value| {
+            def.columns[i]
+                .setter
+                .as_ref()
+                .expect("apply runs only for writable columns")(row, value)
+        },
+    )
 }
