@@ -20,8 +20,8 @@ use super::ffi::{
 };
 use super::{
     ColumnType, FILTER_NONE, ModifyHook, RowIterator, TransactionHooks, TransactionLifecycle,
-    WriteCaps, WriteSurfaceRegistry, apply_update_columns, connect_write_surface,
-    destroy_write_surface,
+    WriteCaps, WriteSurfaceRegistry, apply_update_columns, begin_vtab_callback,
+    connect_write_surface, destroy_write_surface, vtab_callback_failure,
 };
 
 type Getter = dyn for<'a> Fn(&mut FunctionContext<'a>, usize) + 'static;
@@ -993,11 +993,12 @@ unsafe extern "C" fn vtab_update(
                 }
                 vtab.transaction.touch();
                 call_modify_hook(&vtab.def, &format!("DELETE FROM {}", vtab.def.name));
+                begin_vtab_callback();
                 if delete_row(raw_rowid as usize) {
                     vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
-                return Err(Error::Message("virtual table delete failed".to_string()));
+                return Err(vtab_callback_failure("virtual table delete failed"));
             }
 
             if argc > 1 && !old_rowid.is_null() {
@@ -1052,6 +1053,7 @@ unsafe extern "C" fn vtab_update(
                 vtab.transaction.touch();
                 call_modify_hook(&vtab.def, &format!("INSERT INTO {}", vtab.def.name));
                 let args = build_args(argc - 2, argv.add(2));
+                begin_vtab_callback();
                 if insert_row(&args) {
                     if !rowid.is_null() {
                         *rowid = 0;
@@ -1059,7 +1061,7 @@ unsafe extern "C" fn vtab_update(
                     vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
-                return Err(Error::Message("virtual table insert failed".to_string()));
+                return Err(vtab_callback_failure("virtual table insert failed"));
             }
 
             Ok(ffi::SQLITE_READONLY)

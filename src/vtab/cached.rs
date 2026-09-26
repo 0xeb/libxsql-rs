@@ -24,8 +24,8 @@ use super::ffi::{
 use super::index::InsertFn;
 use super::{
     ColumnType, FILTER_NONE, ModifyHook, RowIterator, TransactionHooks, TransactionLifecycle,
-    TransactionState, WriteCaps, WriteSurfaceRegistry, apply_update_columns, connect_write_surface,
-    destroy_write_surface,
+    TransactionState, WriteCaps, WriteSurfaceRegistry, apply_update_columns, begin_vtab_callback,
+    connect_write_surface, destroy_write_surface, vtab_callback_failure,
 };
 
 const CACHED_ROWID_SCAN: c_int = -3;
@@ -1705,6 +1705,7 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
                     .ensure_query_scoped_mutation_snapshot(&transaction_state)?;
                 vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
+                begin_vtab_callback();
                 let deleted = cached_delete_reconstruct(
                     &vtab.def,
                     &transaction_state,
@@ -1717,7 +1718,7 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
                     vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
-                return Err(Error::Message("cached table delete failed".to_string()));
+                return Err(vtab_callback_failure("cached table delete failed"));
             }
 
             if argc > 1 && !old_rowid.is_null() {
@@ -1763,6 +1764,7 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
                 vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
                 let args = build_args(argc - 2, argv.add(2));
+                begin_vtab_callback();
                 if insert_row(&args) {
                     if !rowid.is_null() {
                         *rowid = 0;
@@ -1772,7 +1774,7 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
                     vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
-                return Err(Error::Message("cached table insert failed".to_string()));
+                return Err(vtab_callback_failure("cached table insert failed"));
             }
 
             Ok(ffi::SQLITE_READONLY)

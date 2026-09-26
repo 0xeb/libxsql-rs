@@ -42,7 +42,8 @@ libxsql = { path = "." }
   formatting, O(one-row) JSON/NDJSON streaming for read-only queries, and SQL
   export helpers. Mutating `RETURNING` rows are held until the statement commits.
 - A typed runtime-setting registry with a connection-isolated, transactional
-  `runtime_settings(key, value, type, scope)` virtual table, plus the canonical
+  `runtime_settings(key, value, type, scope, kind, settable)` virtual table,
+  plus the canonical
   `sql_capabilities(name, is_supported, notes)` discovery table.
 - Preparation-inclusive timeouts and sticky cooperative cancellation through
   `vtab_interrupted`: read-only queries may return explicit partial results,

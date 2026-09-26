@@ -25,7 +25,8 @@ use super::index::InsertFn;
 use super::{
     ColumnType, ConstraintOp, ConstraintRequest, FILTER_NONE, Generator, GeneratorConstraintArg,
     ModifyHook, RowIterator, TransactionHooks, TransactionLifecycle, WriteCaps,
-    WriteSurfaceRegistry, apply_update_columns, connect_write_surface, destroy_write_surface,
+    WriteSurfaceRegistry, apply_update_columns, begin_vtab_callback, connect_write_surface,
+    destroy_write_surface, vtab_callback_failure,
 };
 
 const MISSING_REQUIRED_CONSTRAINT: c_int = -2;
@@ -1270,12 +1271,13 @@ unsafe extern "C" fn generator_vtab_update<Row: 'static>(
                 let operation = format!("DELETE FROM {}", vtab.def.name);
                 vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
+                begin_vtab_callback();
                 if delete_row(&row) {
                     call_cached_modify_hook(&vtab.def.after_modify, &operation);
                     vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
-                return Err(Error::Message("generator table delete failed".to_string()));
+                return Err(vtab_callback_failure("generator table delete failed"));
             }
 
             if argc > 1 && !old_rowid.is_null() {
@@ -1316,6 +1318,7 @@ unsafe extern "C" fn generator_vtab_update<Row: 'static>(
                 vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
                 let args = build_args(argc - 2, argv.add(2));
+                begin_vtab_callback();
                 if insert_row(&args) {
                     if !rowid.is_null() {
                         *rowid = 0;
@@ -1324,7 +1327,7 @@ unsafe extern "C" fn generator_vtab_update<Row: 'static>(
                     vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
-                return Err(Error::Message("generator table insert failed".to_string()));
+                return Err(vtab_callback_failure("generator table insert failed"));
             }
 
             Ok(ffi::SQLITE_READONLY)

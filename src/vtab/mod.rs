@@ -29,9 +29,9 @@ pub(crate) fn replace_vtab_interrupt_checker(
 
 /// Set a detailed error for the current virtual-table mutation callback.
 ///
-/// A writable column setter still returns `bool`; returning `false` after
-/// calling this function makes SQLite surface this message instead of the
-/// generic setter-failed diagnostic.
+/// A writable column setter, insert, or delete callback still returns `bool`;
+/// returning `false` after calling this function makes SQLite surface this
+/// message instead of the generic failure diagnostic.
 pub fn set_vtab_error(message: impl Into<String>) {
     VTAB_CALLBACK_ERROR.with(|slot| {
         *slot.borrow_mut() = Some(message.into());
@@ -40,6 +40,18 @@ pub fn set_vtab_error(message: impl Into<String>) {
 
 fn take_vtab_callback_error() -> Option<String> {
     VTAB_CALLBACK_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
+/// Drop any reason left by an earlier callback, before invoking an insert or
+/// delete callback.
+pub(crate) fn begin_vtab_callback() {
+    let _ = take_vtab_callback_error();
+}
+
+/// The error for an insert or delete callback that returned `false`: the reason
+/// it set with [`set_vtab_error`], else `fallback`.
+pub(crate) fn vtab_callback_failure(fallback: &str) -> Error {
+    Error::Message(take_vtab_callback_error().unwrap_or_else(|| fallback.to_string()))
 }
 
 /// Returns true if the thread-local interrupt checker reports that the current

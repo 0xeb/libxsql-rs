@@ -103,7 +103,11 @@ pub struct RuntimeSettingSpec {
     pub maximum: i64,
 }
 
-/// One row in `runtime_settings(key, value, type, scope)`.
+/// One row in `runtime_settings(key, value, type, scope, kind, settable)`.
+///
+/// `kind` and `settable` exist because `scope` cannot answer "may I change
+/// this?": `query_timeout_ms` (tunable) and `max_timeout_stack_depth` (a
+/// read-only live counter) are both `common`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeSettingEntry {
     /// Setting key.
@@ -114,6 +118,10 @@ pub struct RuntimeSettingEntry {
     pub value_type: String,
     /// Owning scope.
     pub scope: String,
+    /// `"value"` or `"action"`.
+    pub kind: String,
+    /// `1` only when `UPDATE runtime_settings` accepts the row.
+    pub settable: i32,
 }
 
 /// Internal adapter row used by [`define_runtime_settings_table`].
@@ -294,11 +302,16 @@ impl RuntimeSettingsCore {
             .iter()
             .map(|key| {
                 let record = &state.settings[key];
+                // An action row is never settable even if registered
+                // writable: timeout_push/timeout_pop are verbs, not values.
+                let is_action = record.spec.scope == "action";
                 RuntimeSettingEntry {
                     key: key.clone(),
                     value: Self::effective_value(&state, key, record),
                     value_type: record.spec.setting_type.name().to_string(),
                     scope: record.spec.scope.clone(),
+                    kind: if is_action { "action" } else { "value" }.to_string(),
+                    settable: i32::from(record.spec.writable && !is_action),
                 }
             })
             .collect()
@@ -923,7 +936,8 @@ fn finish_runtime_settings_transaction(
 }
 
 /// Build the canonical transactional
-/// `runtime_settings(key TEXT, value TEXT, type TEXT, scope TEXT)` table.
+/// `runtime_settings(key TEXT, value TEXT, type TEXT, scope TEXT,
+/// kind TEXT, settable INT)` table.
 ///
 /// The same definition may be registered with multiple databases; every
 /// registration receives an isolated staged overlay.
@@ -1098,6 +1112,8 @@ pub fn define_runtime_settings_table(
         )
         .column_text("type", |row| row.entry.value_type.clone())
         .column_text("scope", |row| row.entry.scope.clone())
+        .column_text("kind", |row| row.entry.kind.clone())
+        .column_int("settable", |row| row.entry.settable)
         .build()
 }
 

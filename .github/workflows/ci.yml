@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*", "V*"]
   pull_request:
 
 # Cancel superseded runs on the same ref.
@@ -57,3 +58,24 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
+
+      # Validates the crates.io package (manifest, included files, a clean build
+      # of the packaged sources) without uploading anything.
+      - name: Package (dry run)
+        run: cargo publish --dry-run
+
+  # A version tag publishes a source-only GitHub Release once every platform
+  # passes. crates.io publication is separate and not wired here.
+  publish-release:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: libxsql-rs ${{ github.ref_name }}
+          generate_release_notes: true
