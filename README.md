@@ -1,5 +1,11 @@
 # libxsql-rs
 
+<p align="center">
+  <a href="https://paypal.me/EliasBachaalany"><img alt="Donate with PayPal" src="https://img.shields.io/badge/Donate-PayPal-0070e0?style=for-the-badge&logo=paypal&logoColor=white"></a>
+  <a href="https://buymeacoffee.com/0xeb"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black"></a>
+  <a href="https://github.com/0xeb/libxsql-rs"><img alt="Star libxsql-rs on GitHub" src="https://img.shields.io/github/stars/0xeb/libxsql-rs?style=for-the-badge&logo=github&label=Star&color=24292f"></a>
+</p>
+
 `libxsql-rs` is a Rust port of [libxsql](https://github.com/0xeb/libxsql) for exposing Rust data through SQLite.
 It provides safe, typed builders for SQLite virtual tables while keeping direct
 access to the SQLite planner, update callbacks, scalar functions, aggregate
@@ -130,6 +136,18 @@ cargo fmt --check
 cargo clippy --all-features --all-targets
 cargo build --examples --all-features
 ```
+
+## Support
+
+If libxsql-rs saves you time, a donation funds the next release, and a star helps others find it.
+
+<p>
+  <a href="https://paypal.me/EliasBachaalany"><img alt="Donate with PayPal" src="https://img.shields.io/badge/Donate-PayPal-0070e0?style=for-the-badge&logo=paypal&logoColor=white"></a>
+  <a href="https://buymeacoffee.com/0xeb"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black"></a>
+  <a href="https://github.com/0xeb/libxsql-rs"><img alt="Star libxsql-rs on GitHub" src="https://img.shields.io/github/stars/0xeb/libxsql-rs?style=for-the-badge&logo=github&label=Star&color=24292f"></a>
+</p>
+
+Bug reports with a minimal reproduction are just as valuable.
 
 ## License and Terms of Use
 
