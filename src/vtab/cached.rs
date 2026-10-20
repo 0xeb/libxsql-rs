@@ -7,7 +7,7 @@
 use crate::error::{Error, Result, sqlite_ok};
 use crate::function::{FunctionArg, FunctionContext, build_args};
 use libsqlite3_sys as ffi;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -16,16 +16,21 @@ use std::rc::Rc;
 
 use super::column_helpers;
 use super::ffi::{
-    call_cached_modify_hook, callback_status, finish_cursor_unit, finish_vtab_unit,
-    like_constraint_has_usable_prefix, parse_col_used, quote_identifier, set_vtab_error,
-    sqlite_mprintf_string, sqlite3_vtab_nochange, unsupported_delete, unsupported_insert,
-    unsupported_update,
+    c_string_to_string, call_cached_modify_hook, callback_status, finish_cursor_unit,
+    finish_vtab_unit, like_constraint_has_usable_prefix, parse_col_used, quote_identifier,
+    resolve_constraint_specs, set_vtab_error, sqlite_mprintf_string, sqlite3_vtab_nochange,
+    unsupported_delete, unsupported_insert, unsupported_update,
 };
 use super::index::InsertFn;
+use super::index_key;
+use super::index_key::{
+    KeyBound, KeyOperand, exact_key, key_operand, key_satisfies, lower_bound, upper_bound,
+};
 use super::{
-    ColumnType, FILTER_NONE, ModifyHook, RowIterator, TransactionHooks, TransactionLifecycle,
-    TransactionState, WriteCaps, WriteSurfaceRegistry, apply_update_columns, begin_vtab_callback,
-    connect_write_surface, destroy_write_surface, vtab_callback_failure,
+    ColumnType, ConstraintOp, ConstraintRequest, FILTER_NONE, GeneratorConstraintArg, ModifyHook,
+    RowIterator, TransactionHooks, TransactionLifecycle, TransactionState, WriteCaps,
+    WriteSurfaceRegistry, apply_update_columns, begin_vtab_callback, connect_write_surface,
+    destroy_write_surface, table_write_counter, vtab_callback_failure,
 };
 
 const CACHED_ROWID_SCAN: c_int = -3;
@@ -52,6 +57,22 @@ const RANGE_HIGH_STRICT: c_int = 0x8; // upper bound is strict (<, not <=)
 const RANGE_FLAG_MASK: c_int =
     RANGE_HAS_LOW | RANGE_LOW_STRICT | RANGE_HAS_HIGH | RANGE_HIGH_STRICT;
 
+// Multi-column/operator constraint filters use a disjoint high range, tested in
+// xFilter BEFORE the range decode (whose encoding is open ended). Mirrors the C++
+// CACHED_CONSTRAINT_FILTER_BASE.
+const CACHED_CONSTRAINT_FILTER_BASE: c_int = 1_000_000;
+// The range space `CACHED_RANGE_BASE + index_pos * CACHED_RANGE_STRIDE` would
+// reach the constraint-filter space at this many indexes, and the equality space
+// `CACHED_INDEX_BASE + index_pos` would reach the range space earlier still;
+// build() rejects a table past the lower bound instead of mis-dispatching a plan.
+const CACHED_MAX_INDEXES: usize = {
+    let range = (CACHED_CONSTRAINT_FILTER_BASE - CACHED_RANGE_BASE) / CACHED_RANGE_STRIDE;
+    let equality = CACHED_RANGE_BASE - CACHED_INDEX_BASE;
+    (if range < equality { range } else { equality }) as usize
+};
+const _: () = assert!(CACHED_CONSTRAINT_FILTER_BASE > CACHED_RANGE_BASE);
+const _: () = assert!(CACHED_RANGE_BASE > CACHED_INDEX_BASE);
+
 type CachedGetter<Row> = dyn for<'a> Fn(&mut FunctionContext<'a>, &Row) + 'static;
 type CachedSetter<Row> = dyn for<'a> Fn(&mut Row, &FunctionArg<'a>) -> bool + 'static;
 type CachedBuilder<Row> = dyn Fn(&mut Vec<Row>) + 'static;
@@ -65,6 +86,8 @@ type CachedRowid<Row> = dyn Fn(&Row) -> i64 + 'static;
 type CachedDelete<Row> = dyn Fn(&Row) -> bool + 'static;
 type CachedLookup<Row> = dyn Fn(i64) -> Option<Row> + 'static;
 type CachedPopulator<Row> = dyn for<'a> Fn(&[FunctionArg<'a>]) -> Option<Row> + 'static;
+type CachedConstraintFactory =
+    dyn for<'a> Fn(&[GeneratorConstraintArg<'a>]) -> Box<dyn RowIterator> + 'static;
 
 struct CachedColumnDef<Row> {
     name: String,
@@ -86,6 +109,28 @@ struct CachedFilterDef {
 struct CachedIndexDef<Row> {
     column_index: usize,
     key: Box<CachedIndexKey<Row>>,
+}
+
+struct CachedConstraintSpec {
+    column_index: usize,
+    op: ConstraintOp,
+    required: bool,
+}
+
+/// A multi-column/operator pushdown (for example an interval containment
+/// `p.value >= i.start AND p.value < i.end`) that a single-column filter cannot
+/// express. xBestIndex picks the cheapest spec set whose required constraints are
+/// all present and encodes the chosen spec positions in idxStr. Mirrors the C++
+/// `CachedConstraintFilterDef`.
+struct CachedConstraintFilterDef {
+    specs: Vec<CachedConstraintSpec>,
+    filter_id: c_int,
+    estimated_cost: f64,
+    estimated_rows: i64,
+    /// `Some`: factory-backed and exact (`constraint_filter`). `None`: evaluated
+    /// in memory over the table's rows through its `index_on` keys
+    /// (`constraint_cache_filter`).
+    factory: Option<Box<CachedConstraintFactory>>,
 }
 
 /// A per-index sorted view used ONLY for range (>=, >, <=, <, BETWEEN)
@@ -201,11 +246,13 @@ struct CachedInner<Row> {
     stateful_cache_builder: Option<Box<StatefulCachedBuilder<Row>>>,
     columns: Vec<CachedColumnDef<Row>>,
     filters: Vec<CachedFilterDef>,
+    constraint_filters: Vec<CachedConstraintFilterDef>,
     indexes: Vec<CachedIndexDef<Row>>,
     rowid: Option<Box<CachedRowid<Row>>>,
     before_modify: Option<Box<ModifyHook>>,
     after_modify: Option<Box<ModifyHook>>,
     transaction_hooks: TransactionHooks,
+    counts_as_write: bool,
     delete_row: Option<Box<CachedDelete<Row>>>,
     insert_row: Option<Box<InsertFn>>,
     row_lookup: Option<Box<CachedLookup<Row>>>,
@@ -213,6 +260,11 @@ struct CachedInner<Row> {
     update_from_column_values: bool,
     use_shared_cache: bool,
     shared_cache: RefCell<SharedCache<Row>>,
+    /// Monotonic count of writes through this table (INSERT/UPDATE/DELETE). A
+    /// query-scoped cursor-lived cache records the value it was built at and is
+    /// reused across that cursor's xFilter calls only while it still matches.
+    /// Mirrors the C++ `CachedTableDef::write_generation`.
+    write_generation: Cell<u64>,
 }
 
 impl<Row> CachedInner<Row> {
@@ -249,6 +301,18 @@ impl<Row> CachedInner<Row> {
         self.indexes
             .iter()
             .position(|index| index.column_index == column_index)
+    }
+
+    /// Whether `row` passes every `(index position, operator, operand)` test of
+    /// an in-memory constraint filter.
+    fn row_matches_constraints(
+        &self,
+        row: &Row,
+        tests: &[(usize, ConstraintOp, KeyOperand)],
+    ) -> bool {
+        tests
+            .iter()
+            .all(|&(pos, op, operand)| key_satisfies((self.indexes[pos].key)(row), op, operand))
     }
 
     fn build_rows(&self, state: &TransactionState, rows: &mut Vec<Row>, col_used: u64) {
@@ -305,6 +369,8 @@ impl<Row> CachedInner<Row> {
     /// is cleared, but `data` is retained as a snapshot so the rest of an
     /// in-progress scan can keep resolving rows positionally.
     fn invalidate_shared_cache(&self) {
+        self.write_generation
+            .set(self.write_generation.get().wrapping_add(1));
         if !self.use_shared_cache {
             return;
         }
@@ -319,6 +385,8 @@ impl<Row> CachedInner<Row> {
     /// in any snapshot, so positional reconstruction would be invalid; force a
     /// full rebuild on next use. Mirrors the C++ `invalidate_cache`.
     fn clear_shared_cache(&self) {
+        self.write_generation
+            .set(self.write_generation.get().wrapping_add(1));
         if !self.use_shared_cache {
             return;
         }
@@ -409,6 +477,20 @@ impl<Row> CachedTableDef<Row> {
         &self.inner.name
     }
 
+    /// Drops this table's cached rows so the next scan rebuilds them from the
+    /// source, and retires every query-scoped cursor cache built before the call.
+    ///
+    /// Clones of a definition share one cache, so this reaches the copy a
+    /// [`Database`](crate::Database) registered. Unlike a write through the
+    /// table, it also discards the shared-cache data rather than keeping it as a
+    /// snapshot. Mirrors the C++ `CachedTableDef::invalidate_cache`. To reach
+    /// every cached table on a connection without holding their definitions, use
+    /// [`FunctionContext::invalidate_cached_tables`] or
+    /// [`Database::invalidate_cached_tables`](crate::Database::invalidate_cached_tables).
+    pub fn invalidate_cache(&self) {
+        self.inner.clear_shared_cache();
+    }
+
     /// Compute write-surface capabilities for the prepare-time authorizer
     /// (mirrors the C++ cached `record_write_surface`): insertable/deletable iff
     /// the callback is present, updatable iff any column has a setter.
@@ -438,11 +520,13 @@ pub fn cached_table<Row: 'static>(name: impl Into<String>) -> CachedTableBuilder
         stateful_cache_builder: None,
         columns: Vec::new(),
         filters: Vec::new(),
+        constraint_filters: Vec::new(),
         indexes: Vec::new(),
         rowid: None,
         before_modify: None,
         after_modify: None,
         transaction_hooks: TransactionHooks::default(),
+        counts_as_write: true,
         delete_row: None,
         insert_row: None,
         row_lookup: None,
@@ -462,11 +546,13 @@ pub struct CachedTableBuilder<Row> {
     stateful_cache_builder: Option<Box<StatefulCachedBuilder<Row>>>,
     columns: Vec<CachedColumnDef<Row>>,
     filters: Vec<CachedFilterDef>,
+    constraint_filters: Vec<CachedConstraintFilterDef>,
     indexes: Vec<CachedIndexDef<Row>>,
     rowid: Option<Box<CachedRowid<Row>>>,
     before_modify: Option<Box<ModifyHook>>,
     after_modify: Option<Box<ModifyHook>>,
     transaction_hooks: TransactionHooks,
+    counts_as_write: bool,
     delete_row: Option<Box<CachedDelete<Row>>>,
     insert_row: Option<Box<InsertFn>>,
     row_lookup: Option<Box<CachedLookup<Row>>>,
@@ -554,6 +640,15 @@ impl<Row: 'static> CachedTableBuilder<Row> {
     /// Install the complete SQLite transaction lifecycle for this table.
     pub fn transaction_hooks(mut self, transaction_hooks: TransactionHooks) -> Self {
         self.transaction_hooks = transaction_hooks;
+        self
+    }
+
+    /// Whether this table's row writes bump the connection's
+    /// [`Database::vtab_write_count`](crate::Database::vtab_write_count)
+    /// (default `true`). A session or bookkeeping table (settings, checkpoints,
+    /// previews) passes `false`, so writing it does not read as a host change.
+    pub fn counts_as_write(mut self, counts_as_write: bool) -> Self {
+        self.counts_as_write = counts_as_write;
         self
     }
 
@@ -687,31 +782,47 @@ impl<Row: 'static> CachedTableBuilder<Row> {
 
     /// Add a writable `INTEGER` (`i32`) column; the setter returns false to
     /// reject the write.
+    ///
+    /// The setter receives only the integer the written value equals under
+    /// SQLite's INTEGER comparison ([`exact_i64`](crate::exact_i64): `16`,
+    /// `16.0` and `'16'` all arrive as 16). NULL, a blob, `16.5`, `'0x10'` or
+    /// `'abc'` refuse the write with `column "<name>": expected an integer, got
+    /// ...` and the setter does not run.
+    /// An integer outside `i32` is refused too (`column "<name>": <value> does
+    /// not fit a 32-bit integer`).
     pub fn column_int_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> i32 + 'static,
         S: Fn(&mut Row, i32) -> bool + 'static,
     {
+        let name = name.into();
         self.add_column(
-            name,
+            name.clone(),
             ColumnType::Integer,
             column_helpers::row_getter_int(getter),
-            Some(column_helpers::row_setter_int(setter)),
+            Some(column_helpers::row_setter_int(name, setter)),
         )
     }
 
     /// Add a writable `INTEGER` (`i64`) column; the setter returns false to
     /// reject the write.
+    ///
+    /// The setter receives only the integer the written value equals under
+    /// SQLite's INTEGER comparison ([`exact_i64`](crate::exact_i64): `16`,
+    /// `16.0` and `'16'` all arrive as 16). NULL, a blob, `16.5`, `'0x10'` or
+    /// `'abc'` refuse the write with `column "<name>": expected an integer, got
+    /// ...` and the setter does not run.
     pub fn column_i64_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(&Row) -> i64 + 'static,
         S: Fn(&mut Row, i64) -> bool + 'static,
     {
+        let name = name.into();
         self.add_column(
-            name,
+            name.clone(),
             ColumnType::Integer,
             column_helpers::row_getter_i64(getter),
-            Some(column_helpers::row_setter_i64(setter)),
+            Some(column_helpers::row_setter_i64(name, setter)),
         )
     }
 
@@ -809,6 +920,11 @@ impl<Row: 'static> CachedTableBuilder<Row> {
 
     /// Register an equality-pushdown filter on `column_name` backed by a
     /// [`RowIterator`] factory keyed by an `i64` value.
+    ///
+    /// The constraint is omitted (SQLite trusts the rows), so the value is compared
+    /// the way SQLite compares an INTEGER column: the factory is called only with the
+    /// integer that equals it (`10`, `10.0`, `'10'`), and a value no integer equals
+    /// (`10.5`, `'a'`, NULL, a blob) yields no rows without calling it.
     pub fn filter_eq<F>(
         self,
         column_name: impl AsRef<str>,
@@ -825,12 +941,18 @@ impl<Row: 'static> CachedTableBuilder<Row> {
             true,
             estimated_cost,
             estimated_rows,
-            move |value| factory(value.as_i64()),
+            move |value| match index_key::exact_i64(value) {
+                Some(key) => factory(key),
+                None => Box::new(index_key::NoRows),
+            },
         )
     }
 
     /// Register an equality-pushdown filter on `column_name` backed by a
     /// [`RowIterator`] factory keyed by a text value.
+    ///
+    /// The constraint is omitted, so NULL (which equals nothing) and a blob (which
+    /// never equals text) yield no rows without calling the factory.
     pub fn filter_eq_text<F>(
         self,
         column_name: impl AsRef<str>,
@@ -847,9 +969,9 @@ impl<Row: 'static> CachedTableBuilder<Row> {
             true,
             estimated_cost,
             estimated_rows,
-            move |value| {
-                let text = value.as_c_str().map(CStr::to_string_lossy);
-                factory(text.as_deref().unwrap_or(""))
+            move |value| match index_key::exact_text(value) {
+                Some(text) => factory(&text),
+                None => Box::new(index_key::NoRows),
             },
         )
     }
@@ -895,7 +1017,123 @@ impl<Row: 'static> CachedTableBuilder<Row> {
         self
     }
 
-    /// Set a callback computing a stable rowid from a row.
+    /// Add an exact, factory-backed multi-column/operator pushdown. When every
+    /// required constraint is present (and at least one constraint matches) and
+    /// this is the cheapest plan, SQLite hands the matched values to `factory`
+    /// and does not re-check them, so the iterator must return exactly the rows
+    /// that satisfy them. A missing required constraint only disqualifies the
+    /// filter: the table falls back to its other plans.
+    ///
+    /// Errors when a constraint names an unknown column, or when `constraints`
+    /// is empty. Mirrors the C++ `CachedTableBuilder::constraint_filter`.
+    pub fn constraint_filter<I, F>(
+        self,
+        constraints: I,
+        factory: F,
+        estimated_cost: f64,
+        estimated_rows: f64,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = ConstraintRequest>,
+        F: for<'a> Fn(&[GeneratorConstraintArg<'a>]) -> Box<dyn RowIterator> + 'static,
+    {
+        self.add_constraint_filter(
+            "constraint_filter",
+            constraints,
+            estimated_cost,
+            estimated_rows,
+            Some(Box::new(factory)),
+        )
+    }
+
+    /// Add an exact multi-column/operator pushdown evaluated in memory over the
+    /// table's rows: the shared cache for a shared table, the cursor-lived rows
+    /// for a query-scoped one. Every constrained column needs an earlier
+    /// [`index_on`](Self::index_on), whose integer key supplies the compared
+    /// value (compared as SQLite does: NULL never matches, text sorts after every
+    /// number).
+    ///
+    /// Errors when a constraint names an unknown column, a column without an
+    /// index, or `LIKE` (not evaluable against an integer key), or when
+    /// `constraints` is empty. Mirrors the C++
+    /// `CachedTableBuilder::constraint_cache_filter`.
+    pub fn constraint_cache_filter<I>(
+        self,
+        constraints: I,
+        estimated_cost: f64,
+        estimated_rows: f64,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = ConstraintRequest>,
+    {
+        self.add_constraint_filter(
+            "constraint_cache_filter",
+            constraints,
+            estimated_cost,
+            estimated_rows,
+            None,
+        )
+    }
+
+    fn add_constraint_filter<I>(
+        mut self,
+        builder: &str,
+        constraints: I,
+        estimated_cost: f64,
+        estimated_rows: f64,
+        factory: Option<Box<CachedConstraintFactory>>,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = ConstraintRequest>,
+    {
+        let fail = |detail: String| {
+            Error::Message(format!("{builder} on table '{}': {detail}", self.name))
+        };
+        let mut specs = Vec::new();
+        for request in constraints {
+            let column_index = self
+                .find_column(&request.column_name)
+                .ok_or_else(|| fail(format!("unknown column '{}'", request.column_name)))?;
+            if factory.is_none() {
+                if self.find_index(column_index).is_none() {
+                    return Err(fail(format!(
+                        "column '{}' needs a matching index_on() to supply its comparison value",
+                        request.column_name
+                    )));
+                }
+                if request.op == ConstraintOp::Like {
+                    return Err(fail(format!(
+                        "LIKE is not evaluable against an integer index key (column '{}')",
+                        request.column_name
+                    )));
+                }
+            }
+            specs.push(CachedConstraintSpec {
+                column_index,
+                op: request.op,
+                required: request.required,
+            });
+        }
+        if specs.is_empty() {
+            return Err(fail("needs at least one constraint".to_string()));
+        }
+        let filter_id = CACHED_CONSTRAINT_FILTER_BASE + self.constraint_filters.len() as c_int;
+        self.constraint_filters.push(CachedConstraintFilterDef {
+            specs,
+            filter_id,
+            estimated_cost,
+            estimated_rows: estimated_rows.max(1.0) as i64,
+            factory,
+        });
+        Ok(self)
+    }
+
+    /// Set a callback computing a stable rowid (a KEY) from a row. Full and index
+    /// scans then report `rowid(row)` instead of the cache position, and
+    /// `WHERE rowid = ?` matches it by key.
+    ///
+    /// Mandatory with [`row_lookup`](Self::row_lookup): it must return the same key
+    /// the table's filter iterators report and `row_lookup` resolves.
     pub fn rowid<F>(mut self, rowid: F) -> Self
     where
         F: Fn(&Row) -> i64 + 'static,
@@ -904,8 +1142,18 @@ impl<Row: 'static> CachedTableBuilder<Row> {
         self
     }
 
-    /// Set a callback that resolves a single row by rowid, used for rowid lookups
-    /// and update/delete reconstruction.
+    /// Set a callback that resolves a rowid (a KEY, never a cache position) back
+    /// to its row. It becomes the SOLE authority for UPDATE, DELETE and
+    /// `WHERE rowid = ?`: a rowid it cannot resolve (e.g. a row gone mid-statement)
+    /// fails the write with `row <id> not found in <table>` (or the reason the
+    /// callback set with [`set_vtab_error`](crate::set_vtab_error)) and matches no
+    /// row on read -- never another row by cache position, and never a row
+    /// rebuilt by [`row_populator`](Self::row_populator).
+    ///
+    /// Requires [`rowid`](Self::rowid): a table with `row_lookup` must report keys
+    /// from its full and index scans, computed exactly as its filter iterators
+    /// compute their rowids and as `row_lookup` decodes them.
+    /// [`build`](Self::build) returns an error otherwise.
     pub fn row_lookup<F>(mut self, row_lookup: F) -> Self
     where
         F: Fn(i64) -> Option<Row> + 'static,
@@ -915,7 +1163,9 @@ impl<Row: 'static> CachedTableBuilder<Row> {
     }
 
     /// Set a callback that reconstructs a row from raw column values, used for
-    /// UPDATE reconstruction when the supplied values are available.
+    /// UPDATE reconstruction when the supplied values are available. On a table
+    /// with a [`row_lookup`](Self::row_lookup) it is used only when the table opts
+    /// out via [`update_from_column_values`](Self::update_from_column_values).
     pub fn row_populator<F>(mut self, row_populator: F) -> Self
     where
         F: for<'a> Fn(&[FunctionArg<'a>]) -> Option<Row> + 'static,
@@ -924,8 +1174,11 @@ impl<Row: 'static> CachedTableBuilder<Row> {
         self
     }
 
-    /// Force UPDATE/DELETE to reconstruct rows from the supplied column values
-    /// rather than positionally by rowid.
+    /// Opt out of rowid-based UPDATE reconstruction and the `SQLITE_NOCHANGE`
+    /// optimization: UPDATE reconstructs the row from the real column values via
+    /// [`row_populator`](Self::row_populator), so it sees the new values of its
+    /// identity columns and never interprets the rowid. DELETE still resolves
+    /// through [`row_lookup`](Self::row_lookup) when the table has one.
     pub fn update_from_column_values(mut self) -> Self {
         self.update_from_column_values = true;
         self
@@ -951,7 +1204,8 @@ impl<Row: 'static> CachedTableBuilder<Row> {
     }
 
     /// Finalize the definition; errors if neither a cache builder nor a count
-    /// callback was set.
+    /// callback was set, or if [`row_lookup`](Self::row_lookup) is set without
+    /// [`rowid`](Self::rowid).
     pub fn build(self) -> Result<CachedTableDef<Row>> {
         if self.cache_builder.is_none()
             && self.projection_cache_builder.is_none()
@@ -960,6 +1214,24 @@ impl<Row: 'static> CachedTableBuilder<Row> {
         {
             return Err(Error::Message(format!(
                 "cached table '{}' needs a cache builder or count callback",
+                self.name
+            )));
+        }
+        if self.indexes.len() > CACHED_MAX_INDEXES {
+            return Err(Error::Message(format!(
+                "cached table '{}' registers {} indexes; at most {CACHED_MAX_INDEXES} fit its \
+                 plan encoding",
+                self.name,
+                self.indexes.len()
+            )));
+        }
+        // Row identity: every rowid a row_lookup table's scans report must be a
+        // KEY. Without rowid() a full scan would report a cache POSITION, and a
+        // position read as a key can name a different, existing row.
+        if self.row_lookup.is_some() && self.rowid.is_none() {
+            return Err(Error::Message(format!(
+                "cached table '{}': row_lookup() requires rowid(): scans must report the \
+                 same key row_lookup() resolves, not a cache position",
                 self.name
             )));
         }
@@ -973,11 +1245,13 @@ impl<Row: 'static> CachedTableBuilder<Row> {
                 stateful_cache_builder: self.stateful_cache_builder,
                 columns: self.columns,
                 filters: self.filters,
+                constraint_filters: self.constraint_filters,
                 indexes: self.indexes,
                 rowid: self.rowid,
                 before_modify: self.before_modify,
                 after_modify: self.after_modify,
                 transaction_hooks: self.transaction_hooks,
+                counts_as_write: self.counts_as_write,
                 delete_row: self.delete_row,
                 insert_row: self.insert_row,
                 row_lookup: self.row_lookup,
@@ -985,6 +1259,7 @@ impl<Row: 'static> CachedTableBuilder<Row> {
                 update_from_column_values: self.update_from_column_values,
                 use_shared_cache: self.use_shared_cache,
                 shared_cache: RefCell::new(SharedCache::default()),
+                write_generation: Cell::new(0),
             }),
         })
     }
@@ -1035,6 +1310,12 @@ impl<Row: 'static> CachedTableBuilder<Row> {
     fn find_column(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|column| column.name == name)
     }
+
+    fn find_index(&self, column_index: usize) -> Option<usize> {
+        self.indexes
+            .iter()
+            .position(|index| index.column_index == column_index)
+    }
 }
 
 #[repr(C)]
@@ -1061,6 +1342,12 @@ struct CachedCursor<Row> {
     def: Rc<CachedInner<Row>>,
     transaction_state: TransactionState,
     local_cache: Vec<Row>,
+    /// Set when `local_cache` holds a full-scan build: the projection (colUsed)
+    /// and write generation it was built at. Such a build is cursor-lived --
+    /// reused across this cursor's xFilter calls (a JOIN's inner loop re-filters
+    /// one cursor per outer row) while both still match. `None` whenever
+    /// `local_cache` holds scratch rows (a rowid lookup) instead.
+    local_full_scan: Option<(u64, u64)>,
     current_row: usize,
     iterator: Option<Box<dyn RowIterator>>,
     iterator_eof: bool,
@@ -1076,6 +1363,8 @@ struct CachedCursor<Row> {
     cursor_index_cache: Vec<Row>,
     cursor_indexes: Vec<HashMap<i64, Vec<usize>>>,
     cursor_index_built: bool,
+    /// Write generation `cursor_index_cache` was built at.
+    index_generation: u64,
     /// Parallel sorted views for range pushdown on a query-scoped table, one slot
     /// per index, built lazily on the first range query against this cursor and
     /// reused thereafter (like `cursor_indexes`). Dropped with the cursor. The
@@ -1090,6 +1379,114 @@ struct CachedCursor<Row> {
     rowid_lookup_id: Option<i64>,
     count_only_total: Option<usize>,
 }
+
+/// Connection-wide invalidation of cached tables (the C++ `cache_registry.hpp`).
+///
+/// A query-scoped cached table keeps its rows for the life of one SQLite cursor
+/// and rebuilds only after a write THROUGH the table. A SQL function that changes
+/// the engine behind a table is not such a write and usually holds no handle to
+/// it, so this registry keeps, per connection, one invalidator per registered
+/// cached module. Running one does exactly what a write through that table does
+/// (`invalidate_shared_cache`): a scan already in flight keeps its rows as a
+/// snapshot and every later probe or statement rebuilds.
+///
+/// Connections and definitions are `!Send` (`Rc`), so every module registered
+/// on a connection lives on that connection's thread, and so does every SQL
+/// function call on it: a thread-local registry is exact.
+mod connection_registry {
+    use super::{c_void, ffi};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    type Invalidator = Rc<dyn Fn()>;
+
+    thread_local! {
+        /// connection -> [(module state, invalidator)]
+        static BY_DB: RefCell<HashMap<usize, Vec<(usize, Invalidator)>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    pub(super) fn register(db: *mut ffi::sqlite3, state: *const c_void, invalidate: Invalidator) {
+        let _ = BY_DB.try_with(|map| {
+            map.borrow_mut()
+                .entry(db as usize)
+                .or_default()
+                .push((state as usize, invalidate));
+        });
+    }
+
+    /// Called when SQLite destroys a cached module (connection close, re-register).
+    pub(super) fn unregister(state: *const c_void) {
+        let state = state as usize;
+        // try_with: a module destroyed during thread-local teardown has nothing
+        // left to unregister from.
+        let _ = BY_DB.try_with(|map| {
+            map.borrow_mut().retain(|_, entries| {
+                entries.retain(|(entry, _)| *entry != state);
+                !entries.is_empty()
+            });
+        });
+    }
+
+    /// Runs every invalidator registered on `db`. They are copied out first and
+    /// run with the registry unborrowed, so one may itself reach the registry.
+    pub(crate) fn invalidate(db: *mut ffi::sqlite3) {
+        if db.is_null() {
+            return;
+        }
+        let invalidators: Vec<Invalidator> = BY_DB
+            .try_with(|map| {
+                map.borrow()
+                    .get(&(db as usize))
+                    .map(|entries| entries.iter().map(|(_, f)| f.clone()).collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        for invalidate in invalidators {
+            invalidate();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::BY_DB;
+
+        /// Invalidators registered on this thread; each test runs on its own
+        /// thread, so the count is exact.
+        fn registered() -> usize {
+            BY_DB.with(|map| map.borrow().values().map(Vec::len).sum())
+        }
+
+        #[test]
+        fn registry_drops_closed_connections_and_reregistered_modules() {
+            let def = crate::cached_table::<i64>("reg_conn")
+                .no_shared_cache()
+                .cache_builder(|rows| rows.push(1))
+                .column_i64("id", |row| *row)
+                .build()
+                .expect("definition builds");
+            let mut db = crate::Database::open_memory().expect("open");
+            assert_eq!(registered(), 0);
+            db.register_cached_table_as("reg_conn_mod", &def)
+                .expect("register");
+            assert_eq!(registered(), 1);
+            // Re-registering the module name destroys the old module state.
+            db.register_cached_table_as("reg_conn_mod", &def)
+                .expect("re-register");
+            assert_eq!(registered(), 1, "the replaced module must drop its entry");
+            db.register_cached_table_as("reg_conn_mod2", &def)
+                .expect("second module");
+            assert_eq!(registered(), 2);
+            db.invalidate_cached_tables();
+            db.close();
+            assert_eq!(registered(), 0, "closing must drop every entry");
+            db.invalidate_cached_tables(); // a closed database is a no-op
+        }
+    }
+}
+
+pub(crate) use connection_registry::invalidate as invalidate_connection_cached_tables;
 
 pub(crate) fn register_cached_table<Row: 'static>(
     db: *mut ffi::sqlite3,
@@ -1107,6 +1504,7 @@ pub(crate) fn register_cached_table<Row: 'static>(
         registry,
         caps: def.write_caps(),
     });
+    let invalidated = Rc::downgrade(&state.def);
     let state_ptr = Box::into_raw(state);
     let module_ptr = unsafe { &(*state_ptr).module as *const ffi::sqlite3_module };
     let rc = unsafe {
@@ -1119,6 +1517,18 @@ pub(crate) fn register_cached_table<Row: 'static>(
         )
     };
     if sqlite_ok(rc) {
+        // Let invalidate_cached_tables(db) reach this table -- what a SQL function
+        // that mutates the engine calls, since it holds no table handle.
+        // destroy_cached_module_state removes the entry when SQLite drops the module.
+        connection_registry::register(
+            db,
+            state_ptr.cast_const().cast::<c_void>(),
+            Rc::new(move || {
+                if let Some(def) = invalidated.upgrade() {
+                    def.invalidate_shared_cache();
+                }
+            }),
+        );
         Ok(())
     } else {
         Err(Error::sqlite(rc, crate::function::sqlite_error(db)))
@@ -1154,6 +1564,7 @@ fn create_cached_module<Row: 'static>() -> ffi::sqlite3_module {
 }
 
 unsafe extern "C" fn destroy_cached_module_state<Row>(ptr: *mut c_void) {
+    connection_registry::unregister(ptr.cast_const());
     unsafe {
         if !ptr.is_null() {
             drop(Box::from_raw(ptr.cast::<CachedModuleState<Row>>()));
@@ -1180,7 +1591,10 @@ unsafe extern "C" fn cached_vtab_connect<Row>(
             if !sqlite_ok(rc) {
                 return Err(Error::sqlite(rc, crate::function::sqlite_error(db)));
             }
-            let transaction = TransactionLifecycle::new(&state.def.transaction_hooks)?;
+            let transaction =
+                TransactionLifecycle::new(&state.def.transaction_hooks)?.with_write_counter(
+                    table_write_counter(state.registry, state.def.counts_as_write),
+                );
             let (schema_name, table_name) =
                 connect_write_surface(state.registry, argc, argv, state.caps.clone())?;
             let vtab = Box::new(CachedVtab {
@@ -1233,6 +1647,7 @@ unsafe extern "C" fn cached_vtab_open<Row>(
                 def: vtab.def.clone(),
                 transaction_state: vtab.transaction.state(),
                 local_cache: Vec::new(),
+                local_full_scan: None,
                 current_row: 0,
                 iterator: None,
                 iterator_eof: false,
@@ -1242,6 +1657,7 @@ unsafe extern "C" fn cached_vtab_open<Row>(
                 cursor_index_cache: Vec::new(),
                 cursor_indexes: Vec::new(),
                 cursor_index_built: false,
+                index_generation: 0,
                 cursor_sorted_indexes: Vec::new(),
                 rowid_lookup_id: None,
                 count_only_total: None,
@@ -1276,7 +1692,16 @@ unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
                 .cast::<CachedCursor<Row>>()
                 .as_mut()
                 .ok_or_else(|| Error::Message("xsql cached cursor is null".to_string()))?;
-            cursor.local_cache.clear();
+            // `local_cache` (when it holds a full-scan build) and the
+            // cursor_index_* caches are cursor-lived: kept across this cursor's
+            // xFilter calls and dropped only by a write through the table.
+            let generation = cursor.def.write_generation.get();
+            if cursor.cursor_index_built && cursor.index_generation != generation {
+                cursor.cursor_index_cache.clear();
+                cursor.cursor_indexes.clear();
+                cursor.cursor_sorted_indexes.clear();
+                cursor.cursor_index_built = false;
+            }
             cursor.current_row = 0;
             cursor.iterator = None;
             cursor.iterator_eof = false;
@@ -1302,26 +1727,31 @@ unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
             }
 
             if idx_num == CACHED_ROWID_SCAN && argc > 0 {
-                let target_rowid = FunctionArg::new(*argv).as_i64();
+                // omit=1: only a value an integer rowid can equal finds a row
+                // (`rowid = 1.5`, `rowid = 'a'` and `rowid = NULL` must not read
+                // as 1, 0 and 0).
+                let Some(target_rowid) = index_key::exact_i64(&FunctionArg::new(*argv)) else {
+                    cursor.index_matches = Some(Vec::new());
+                    return Ok(());
+                };
                 // This cursor yields the row with exactly this rowid; record it so
                 // xRowid reports it regardless of how the row is resolved.
                 cursor.rowid_lookup_id = Some(target_rowid);
-                // C++ parity: resolve a rowid lookup through `row_lookup` first when
-                // present (a single-row result, no cache build, and able to find rows
-                // outside the cache). See the reference planner's equivalent path.
-                if let Some(row_lookup) = cursor.def.row_lookup.as_ref()
-                    && let Some(row) = row_lookup(target_rowid)
-                {
+                // `row_lookup` is the sole authority for a table that has one (a
+                // single-row result, no cache build, any sign -- a key may be an
+                // address >= 2^63): a key it cannot resolve is no row, never a
+                // cache position to retry.
+                if let Some(row_lookup) = cursor.def.row_lookup.as_ref() {
+                    cursor.local_full_scan = None;
                     cursor.local_cache.clear();
-                    cursor.local_cache.push(row);
-                    cursor.index_matches = Some(vec![0]);
+                    cursor.local_cache.extend(row_lookup(target_rowid));
+                    cursor.index_matches = Some((0..cursor.local_cache.len()).collect());
                     cursor.index_into_local = true;
                     return Ok(());
                 }
-                // Fall back to the cache: a shared cache (rowid_fn-aware match — more
-                // robust than the C++ positional-only fallback, which would mis-handle
-                // stable-rowid tables) or, for a non-shared table, a freshly built
-                // local cache.
+                // Otherwise match the materialization: by KEY when the table has a
+                // `rowid()` (any sign), else by position -- the shared cache, or a
+                // freshly built local cache for a non-shared table.
                 if cursor.def.use_shared_cache {
                     cursor.def.ensure_shared_cache();
                     let cache = cursor.def.shared_cache.borrow();
@@ -1329,6 +1759,7 @@ unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
                         Some(cached_rowid_matches(&cursor.def, &cache.data, target_rowid));
                 } else {
                     let def = cursor.def.clone();
+                    cursor.local_full_scan = None;
                     def.build_rows(
                         &cursor.transaction_state,
                         &mut cursor.local_cache,
@@ -1344,30 +1775,136 @@ unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
                 return Ok(());
             }
 
+            // Multi-column/operator constraint filter. Tested BEFORE the range
+            // decode, whose open-ended encoding would swallow this idxNum.
+            if idx_num >= CACHED_CONSTRAINT_FILTER_BASE
+                && let Some(filter) = cursor
+                    .def
+                    .constraint_filters
+                    .iter()
+                    .find(|filter| filter.filter_id == idx_num)
+            {
+                let def = cursor.def.clone();
+                let spec_list = c_string_to_string(idx_str).unwrap_or_default();
+                let spec_indices = resolve_constraint_specs(
+                    &spec_list,
+                    filter.specs.len(),
+                    argc.max(0) as usize,
+                    &def.name,
+                )
+                .map_err(Error::Message)?;
+                let args = spec_indices
+                    .into_iter()
+                    .enumerate()
+                    .map(|(arg_index, spec_index)| {
+                        let spec = &filter.specs[spec_index];
+                        GeneratorConstraintArg {
+                            column_index: spec.column_index,
+                            op: spec.op,
+                            value: FunctionArg::new(*argv.add(arg_index)),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                // Factory-backed: the source resolves the predicate exactly and
+                // streams only matching rows; nothing is materialized here.
+                if let Some(factory) = filter.factory.as_ref() {
+                    let mut iterator = factory(&args);
+                    cursor.iterator_eof = !iterator.next()?;
+                    cursor.iterator = Some(iterator);
+                    return Ok(());
+                }
+
+                // Each column has an index_on key (checked when the filter was
+                // built); the operands get the column's INTEGER affinity once.
+                let tests = args
+                    .iter()
+                    .filter_map(|arg| {
+                        def.find_index_by_column(arg.column_index)
+                            .map(|pos| (pos, arg.op, key_operand(&arg.value)))
+                    })
+                    .collect::<Vec<_>>();
+
+                // Cache-backed: evaluate in memory over the table's own
+                // materialization -- the shared cache (built once for the engine
+                // lifetime) or this cursor's rows (built once per cursor, reused
+                // by a JOIN's inner loop, dropped by a write through the table).
+                // Matches are positions, like the equality and range arms.
+                if def.use_shared_cache {
+                    def.ensure_shared_cache();
+                    let cache = def.shared_cache.borrow();
+                    let matches = cache
+                        .data
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| def.row_matches_constraints(row, &tests))
+                        .map(|(position, _)| position)
+                        .collect();
+                    cursor.index_matches = Some(matches);
+                } else {
+                    cursor.ensure_cursor_index_cache();
+                    let matches = cursor
+                        .cursor_index_cache
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| def.row_matches_constraints(row, &tests))
+                        .map(|(position, _)| position)
+                        .collect();
+                    cursor.index_matches = Some(matches);
+                    cursor.index_into_cursor = true;
+                }
+                return Ok(());
+            }
+
             // Range (>=, >, <=, <, BETWEEN) plan on an indexed column. The range
             // base sits above CACHED_INDEX_BASE, so this must be tested BEFORE the
             // equality-index branch below. The sorted view is built lazily here
             // and cached (shared cache for shared tables, per-cursor otherwise).
             if let Some((index_pos, range_flags)) = decode_range_idx(idx_num) {
-                let index_defs = &cursor.def.indexes;
+                let range_def = cursor.def.clone();
+                let index_defs = &range_def.indexes;
                 if index_pos < index_defs.len() {
                     // Decode bounds from argv: low first (if present), then high.
-                    let mut arg = 0isize;
-                    let mut low = 0i64;
-                    let mut high = 0i64;
+                    // Each becomes an inclusive integer bound under SQLite's
+                    // comparison rules (the constraints are omitted, so a truncated
+                    // 14.5 or a text bound read as 0 would return wrong rows).
+                    let mut next_arg = 0;
+                    let mut operand = || {
+                        let value = if next_arg < argc {
+                            key_operand(&FunctionArg::new(*argv.offset(next_arg as isize)))
+                        } else {
+                            KeyOperand::Null
+                        };
+                        next_arg += 1;
+                        value
+                    };
+                    let mut key_flags = 0;
+                    let (mut low, mut high) = (0i64, 0i64);
+                    let mut empty = false;
                     if range_flags & RANGE_HAS_LOW != 0 {
-                        if (arg as c_int) < argc {
-                            low = FunctionArg::new(*argv.offset(arg)).as_i64();
+                        match lower_bound(operand(), range_flags & RANGE_LOW_STRICT != 0) {
+                            KeyBound::Empty => empty = true,
+                            KeyBound::Unbounded => {}
+                            KeyBound::Inclusive(bound) => {
+                                key_flags |= RANGE_HAS_LOW;
+                                low = bound;
+                            }
                         }
-                        arg += 1;
                     }
                     if range_flags & RANGE_HAS_HIGH != 0 {
-                        if (arg as c_int) < argc {
-                            high = FunctionArg::new(*argv.offset(arg)).as_i64();
+                        match upper_bound(operand(), range_flags & RANGE_HIGH_STRICT != 0) {
+                            KeyBound::Empty => empty = true,
+                            KeyBound::Unbounded => {}
+                            KeyBound::Inclusive(bound) => {
+                                key_flags |= RANGE_HAS_HIGH;
+                                high = bound;
+                            }
                         }
-                        arg += 1;
                     }
-                    let _ = arg;
+                    if empty {
+                        cursor.index_matches = Some(Vec::new());
+                        return Ok(());
+                    }
                     if cursor.def.use_shared_cache {
                         cursor.def.ensure_shared_cache();
                         let mut cache = cursor.def.shared_cache.borrow_mut();
@@ -1381,7 +1918,7 @@ unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
                             }
                             let mut matches = Vec::new();
                             cache.sorted_indexes[index_pos].collect_matches(
-                                range_flags,
+                                key_flags,
                                 low,
                                 high,
                                 &mut matches,
@@ -1395,28 +1932,7 @@ unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
                         // Query-scoped: build the per-cursor cache once (reused
                         // across this cursor's xFilter calls), then the sorted
                         // view on demand.
-                        if !cursor.cursor_index_built {
-                            let def = cursor.def.clone();
-                            def.build_rows(
-                                &cursor.transaction_state,
-                                &mut cursor.cursor_index_cache,
-                                u64::MAX,
-                            );
-                            cursor.cursor_indexes = def
-                                .indexes
-                                .iter()
-                                .map(|index| {
-                                    let mut map: HashMap<i64, Vec<usize>> = HashMap::new();
-                                    for (row_index, row) in
-                                        cursor.cursor_index_cache.iter().enumerate()
-                                    {
-                                        map.entry((index.key)(row)).or_default().push(row_index);
-                                    }
-                                    map
-                                })
-                                .collect();
-                            cursor.cursor_index_built = true;
-                        }
+                        cursor.ensure_cursor_index_cache();
                         if cursor.cursor_sorted_indexes.len() != index_defs.len() {
                             cursor.cursor_sorted_indexes.clear();
                             cursor
@@ -1429,7 +1945,7 @@ unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
                         }
                         let mut matches = Vec::new();
                         cursor.cursor_sorted_indexes[index_pos].collect_matches(
-                            range_flags,
+                            key_flags,
                             low,
                             high,
                             &mut matches,
@@ -1444,7 +1960,9 @@ unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
 
             if idx_num >= CACHED_INDEX_BASE && argc > 0 {
                 let index_pos = (idx_num - CACHED_INDEX_BASE) as usize;
-                let key = FunctionArg::new(*argv).as_i64();
+                // Only an integer exactly equal to the value can match (a 10.5,
+                // non-numeric text or NULL matches nothing; '10' is 10).
+                let key = exact_key(key_operand(&FunctionArg::new(*argv)));
                 if cursor.def.use_shared_cache {
                     cursor.def.ensure_shared_cache();
                     let cache = cursor.def.shared_cache.borrow();
@@ -1456,38 +1974,20 @@ unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
                     let matches = cache
                         .indexes
                         .get(index_pos)
-                        .and_then(|index| index.get(&key))
+                        .zip(key)
+                        .and_then(|(index, key)| index.get(&key))
                         .cloned()
                         .unwrap_or_default();
                     cursor.index_matches = Some(matches);
                 } else {
                     // Query-scoped: build the per-cursor cache + hash indexes ONCE,
                     // then reuse across this cursor's xFilter calls (JOIN inner loop).
-                    if !cursor.cursor_index_built {
-                        let def = cursor.def.clone();
-                        def.build_rows(
-                            &cursor.transaction_state,
-                            &mut cursor.cursor_index_cache,
-                            u64::MAX,
-                        );
-                        cursor.cursor_indexes = def
-                            .indexes
-                            .iter()
-                            .map(|index| {
-                                let mut map: HashMap<i64, Vec<usize>> = HashMap::new();
-                                for (row_index, row) in cursor.cursor_index_cache.iter().enumerate()
-                                {
-                                    map.entry((index.key)(row)).or_default().push(row_index);
-                                }
-                                map
-                            })
-                            .collect();
-                        cursor.cursor_index_built = true;
-                    }
+                    cursor.ensure_cursor_index_cache();
                     let matches = cursor
                         .cursor_indexes
                         .get(index_pos)
-                        .and_then(|index| index.get(&key))
+                        .zip(key)
+                        .and_then(|(index, key)| index.get(&key))
                         .cloned()
                         .unwrap_or_default();
                     cursor.index_matches = Some(matches);
@@ -1510,12 +2010,18 @@ unsafe extern "C" fn cached_vtab_filter<Row: 'static>(
             if cursor.def.use_shared_cache {
                 cursor.def.ensure_shared_cache();
             } else {
-                let def = cursor.def.clone();
-                def.build_rows(
-                    &cursor.transaction_state,
-                    &mut cursor.local_cache,
-                    parse_col_used(idx_str),
-                );
+                // Reuse this cursor's rows when nothing could have changed them:
+                // same projection, no write through the table since the build.
+                // Without this a nested-loop JOIN rebuilt the whole table once per
+                // OUTER row.
+                let col_used = parse_col_used(idx_str);
+                let key = (col_used, generation);
+                if cursor.local_full_scan != Some(key) {
+                    let def = cursor.def.clone();
+                    cursor.local_full_scan = None;
+                    def.build_rows(&cursor.transaction_state, &mut cursor.local_cache, col_used);
+                    cursor.local_full_scan = Some(key);
+                }
             }
             Ok(())
         }));
@@ -1576,16 +2082,9 @@ unsafe extern "C" fn cached_vtab_column<Row>(
                 .ok_or_else(|| Error::Message("xsql cached cursor is null".to_string()))?;
             // During UPDATE, SQLite asks for unchanged column values. Returning
             // without a value marks the column SQLITE_NOCHANGE in xUpdate, but only
-            // when xUpdate can reconstruct the row by rowid alone: a positional
-            // shared cache (no stable rowid_fn) or a resolving row_lookup, and never
-            // when the table opts out via update_from_column_values. This must match
-            // the reconstruction path in cached_vtab_update.
-            if sqlite3_vtab_nochange(ctx) != 0
-                && !cursor.def.update_from_column_values
-                && ((cursor.def.rowid.is_none() && cursor.def.use_shared_cache)
-                    || cursor.def.row_lookup.is_some()
-                    || cursor.def.query_scoped_uses_mutation_snapshot())
-            {
+            // when xUpdate reconstructs the row by rowid alone (see
+            // cached_reconstruct_by_rowid, the one predicate both sides share).
+            if sqlite3_vtab_nochange(ctx) != 0 && cached_reconstruct_by_rowid(&cursor.def) {
                 return Ok(());
             }
             let mut fctx = FunctionContext::new(ctx);
@@ -1652,8 +2151,7 @@ unsafe extern "C" fn cached_vtab_rowid<Row>(
                 return Ok(());
             }
             // A rowid-lookup cursor yields the row with the requested rowid; report it
-            // directly (covers row_lookup hits that have no rowid_fn, where the
-            // matched cache offset would otherwise be reported).
+            // directly (a positional table's match, which has no rowid_fn).
             if let Some(target) = cursor.rowid_lookup_id {
                 *rowid = target;
                 return Ok(());
@@ -1705,20 +2203,16 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
                     .ensure_query_scoped_mutation_snapshot(&transaction_state)?;
                 vtab.transaction.touch();
                 call_cached_modify_hook(&vtab.def.before_modify, &operation);
-                begin_vtab_callback();
-                let deleted = cached_delete_reconstruct(
+                cached_delete_reconstruct(
                     &vtab.def,
                     &transaction_state,
                     old_rowid.as_i64(),
                     delete_row,
                 )?;
-                if deleted {
-                    vtab.def.invalidate_shared_cache();
-                    call_cached_modify_hook(&vtab.def.after_modify, &operation);
-                    vtab.transaction.mark_written();
-                    return Ok(ffi::SQLITE_OK);
-                }
-                return Err(vtab_callback_failure("cached table delete failed"));
+                vtab.def.invalidate_shared_cache();
+                call_cached_modify_hook(&vtab.def.after_modify, &operation);
+                vtab.transaction.mark_written();
+                return Ok(ffi::SQLITE_OK);
             }
 
             if argc > 1 && !old_rowid.is_null() {
@@ -1751,8 +2245,9 @@ unsafe extern "C" fn cached_vtab_update<Row: 'static>(
                     vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
-                // No reconstruction branch resolved the row (e.g. a stable rowid_fn on
-                // a shared cache with no row_lookup/row_populator) — read-only, per C++.
+                // No reconstruction branch applies (e.g. a stable rowid_fn on a shared
+                // cache with no row_lookup/row_populator) — read-only, per C++. (A
+                // row_lookup table never gets here: a miss is an error.)
                 return Ok(ffi::SQLITE_READONLY);
             }
 
@@ -1930,9 +2425,46 @@ unsafe extern "C" fn cached_vtab_best_index<Row>(
             let mut range_low_strict = false; // GT (>) vs GE (>=)
             let mut range_high_strict = false; // LT (<) vs LE (<=)
 
+            // The cheapest constraint filter whose required specs are all present;
+            // ties go to the one consuming more constraints (each is a predicate
+            // SQLite no longer re-checks). It then competes by cost below.
+            let mut best_constraint_filter: Option<(&CachedConstraintFilterDef, Vec<c_int>)> = None;
+            let mut best_constraint_matched = 0;
+            for filter in &vtab.def.constraint_filters {
+                let mut matched = vec![-1; filter.specs.len()];
+                let mut matched_count = 0;
+                let mut all_required = true;
+                for (spec_index, spec) in filter.specs.iter().enumerate() {
+                    let found = (0..info.nConstraint).find(|&i| {
+                        let constraint = &*info.aConstraint.add(i as usize);
+                        constraint.usable != 0
+                            && super::ffi::binary_constraint(info, i)
+                            && constraint.iColumn >= 0
+                            && constraint.iColumn as usize == spec.column_index
+                            && constraint.op as c_int == spec.op.sqlite_op()
+                    });
+                    if let Some(i) = found {
+                        matched[spec_index] = i;
+                        matched_count += 1;
+                    } else if spec.required {
+                        all_required = false;
+                        break;
+                    }
+                }
+                let better = best_constraint_filter.as_ref().is_none_or(|(best, _)| {
+                    filter.estimated_cost < best.estimated_cost
+                        || (filter.estimated_cost == best.estimated_cost
+                            && matched_count > best_constraint_matched)
+                });
+                if all_required && matched_count > 0 && better {
+                    best_constraint_filter = Some((filter, matched));
+                    best_constraint_matched = matched_count;
+                }
+            }
+
             for i in 0..info.nConstraint {
                 let constraint = &*info.aConstraint.add(i as usize);
-                if constraint.usable == 0 {
+                if constraint.usable == 0 || !super::ffi::binary_constraint(info, i) {
                     continue;
                 }
                 let op = constraint.op as c_int;
@@ -2050,6 +2582,44 @@ unsafe extern "C" fn cached_vtab_best_index<Row>(
                 return Ok(());
             }
 
+            // A constraint filter must be strictly cheaper than the best
+            // single-column plan (an equality filter, or a shared hash index at 1.0).
+            if let Some((filter, matched)) = best_constraint_filter
+                && filter.estimated_cost < best_cost
+            {
+                // Encode which spec each argv slot carries, in argv order. omit=1
+                // means SQLite does not re-check these, which is why xFilter
+                // treats an undecodable spec index as a hard error.
+                let mut argv_index = 1;
+                let mut idx_parts = Vec::new();
+                for (spec_index, constraint_index) in matched.iter().enumerate() {
+                    if *constraint_index < 0 {
+                        continue;
+                    }
+                    let usage = &mut *info.aConstraintUsage.add(*constraint_index as usize);
+                    usage.argvIndex = argv_index;
+                    usage.omit = 1;
+                    argv_index += 1;
+                    idx_parts.push(spec_index.to_string());
+                }
+                // Replaces the projection colUsed idxStr set above: a constraint
+                // plan never reaches the full-scan build that reads it.
+                if info.needToFreeIdxStr != 0 && !info.idxStr.is_null() {
+                    ffi::sqlite3_free(info.idxStr.cast());
+                }
+                info.idxStr = std::ptr::null_mut();
+                info.needToFreeIdxStr = 0;
+                let idx_str = sqlite_mprintf_string(&idx_parts.join(","));
+                if !idx_str.is_null() {
+                    info.idxStr = idx_str;
+                    info.needToFreeIdxStr = 1;
+                }
+                info.idxNum = filter.filter_id;
+                info.estimatedCost = filter.estimated_cost;
+                info.estimatedRows = filter.estimated_rows;
+                return Ok(());
+            }
+
             if let Some(index_pos) = best_index_pos
                 && best_filter.is_none()
             {
@@ -2137,6 +2707,35 @@ unsafe extern "C" fn cached_vtab_best_index<Row>(
 }
 
 impl<Row> CachedCursor<Row> {
+    /// Build this cursor's rows and hash indexes once; the equality, range and
+    /// constraint-filter arms of a query-scoped table all reuse them across the
+    /// cursor's xFilter calls (a JOIN's inner loop) until a write through the
+    /// table retires them.
+    fn ensure_cursor_index_cache(&mut self) {
+        if self.cursor_index_built {
+            return;
+        }
+        let def = self.def.clone();
+        self.index_generation = def.write_generation.get();
+        def.build_rows(
+            &self.transaction_state,
+            &mut self.cursor_index_cache,
+            u64::MAX,
+        );
+        self.cursor_indexes = def
+            .indexes
+            .iter()
+            .map(|index| {
+                let mut map: HashMap<i64, Vec<usize>> = HashMap::new();
+                for (row_index, row) in self.cursor_index_cache.iter().enumerate() {
+                    map.entry((index.key)(row)).or_default().push(row_index);
+                }
+                map
+            })
+            .collect();
+        self.cursor_index_built = true;
+    }
+
     fn with_current_row<T>(&self, f: impl FnOnce(&Row) -> T) -> Option<T> {
         if let Some(matches) = self.index_matches.as_ref() {
             let row_index = *matches.get(self.current_row)?;
@@ -2162,9 +2761,9 @@ impl<Row> CachedCursor<Row> {
 }
 
 /// Non-shared positional rebuild for UPDATE/DELETE reconstruction: for a
-/// `no_shared_cache` table without a stable `rowid_fn`, the full-scan rowid IS
-/// the row's index in a freshly rebuilt cache, so rebuild and return that row.
-/// Mirrors the reference position-based rebuild fallback.
+/// `no_shared_cache` table without a stable `rowid_fn` (and so without a
+/// `row_lookup`, which requires one), the full-scan rowid IS the row's index in a
+/// freshly rebuilt cache, so rebuild and return that row.
 fn cached_rebuilt_positional_row<Row>(
     def: &CachedInner<Row>,
     state: &TransactionState,
@@ -2185,9 +2784,10 @@ fn cached_rebuilt_positional_row<Row>(
 }
 
 /// A row can be resolved from the rowid alone — a positional shared cache (no
-/// stable `rowid_fn`) or a resolving `row_lookup`, and not opted into argv
-/// reconstruction. MUST match the cached `xColumn` NOCHANGE gate. Mirrors the C++
-/// `reconstruct_by_rowid` predicate in the reference implementation.
+/// stable `rowid_fn`), a `row_lookup` (the sole authority: a rowid it cannot
+/// resolve fails the statement), or a query-scoped mutation snapshot — and the
+/// table is not opted into argv reconstruction. This is also the cached `xColumn`
+/// NOCHANGE gate. Mirrors the C++ `reconstruct_by_rowid` predicate.
 fn cached_reconstruct_by_rowid<Row>(def: &CachedInner<Row>) -> bool {
     !def.update_from_column_values
         && ((def.rowid.is_none() && def.use_shared_cache)
@@ -2211,18 +2811,40 @@ fn cached_query_scoped_snapshot_index<Row>(
 }
 
 /// Resolve a shared-cache row positionally by `old_rowid` — valid only for a
-/// no-`rowid_fn` shared cache. The cache must be usable (built, or a mutation
-/// snapshot with no `row_lookup`) and the rowid in range.
+/// no-`rowid_fn` shared cache (and so one without a `row_lookup`, which resolves
+/// every rowid itself). The cache must be usable (built, or a mutation snapshot)
+/// and the rowid in range.
 fn cached_shared_positional_index<Row>(def: &CachedInner<Row>, old_rowid: i64) -> Option<usize> {
     let index = usize::try_from(old_rowid).ok()?;
     let cache = def.shared_cache.borrow();
-    let usable = cache.built || (cache.mutation_snapshot && def.row_lookup.is_none());
+    let usable = cache.built || cache.mutation_snapshot;
     (usable && index < cache.data.len()).then_some(index)
 }
 
-/// UPDATE row reconstruction, faithfully mirroring the C++ decision tree
-/// Applies non-NOCHANGE writable setters to the resolved
-/// row; returns false when no branch resolves (caller maps that to read-only).
+/// The error for an UPDATE/DELETE rowid that names no row: the reason the
+/// resolving callback set with [`set_vtab_error`](crate::set_vtab_error), else
+/// `row <id> not found in <table>`.
+fn cached_row_not_found<Row>(def: &CachedInner<Row>, rowid: i64) -> Error {
+    vtab_callback_failure(&format!("row {rowid} not found in {}", def.name))
+}
+
+/// Resolve an UPDATE/DELETE rowid through `row_lookup`, the sole authority for a
+/// table that has one: every rowid its scans report is a KEY (`build` requires a
+/// `rowid()`), so a key it cannot resolve is a row that is gone — never a cache
+/// position to retry, and never a row rebuilt from argv.
+fn cached_row_lookup_or_error<Row>(
+    def: &CachedInner<Row>,
+    row_lookup: &dyn Fn(i64) -> Option<Row>,
+    rowid: i64,
+) -> Result<Row> {
+    begin_vtab_callback();
+    row_lookup(rowid).ok_or_else(|| cached_row_not_found(def, rowid))
+}
+
+/// UPDATE row reconstruction, mirroring the C++ decision tree. Applies the
+/// non-NOCHANGE writable setters to the resolved row; returns false when no
+/// branch applies (caller maps that to read-only). A `row_lookup` table resolves
+/// only through it and fails with `row <id> not found in <table>` on a miss.
 fn cached_update_reconstruct_and_apply<'a, Row>(
     def: &CachedInner<Row>,
     state: &TransactionState,
@@ -2233,10 +2855,26 @@ fn cached_update_reconstruct_and_apply<'a, Row>(
     def.ensure_query_scoped_mutation_snapshot(state)?;
     let by_rowid = cached_reconstruct_by_rowid(def);
 
-    // Branches 1 & 2: positional shared cache (no rowid_fn), mutated in place.
-    // Only an ALREADY-built/snapshotted cache qualifies — like C++, never build
-    // the shared cache during a mutation (a filter_eq cursor leaves it unbuilt,
-    // and its iterator rowid is not a reliable cache position).
+    if let Some(row_lookup) = def.row_lookup.as_ref() {
+        let mut row = match def.row_populator.as_ref() {
+            // Opted out (update_from_column_values): NOCHANGE is off, so every
+            // column carries its real value and the row is rebuilt from them. The
+            // rowid is not interpreted at all.
+            Some(populate) if !by_rowid => {
+                begin_vtab_callback();
+                populate(args).ok_or_else(|| cached_row_not_found(def, old_rowid))?
+            }
+            // The sole authority: a key it cannot resolve fails the statement.
+            _ => cached_row_lookup_or_error(def, row_lookup, old_rowid)?,
+        };
+        apply_cached_setters(def, &mut row, args)?;
+        return Ok(true);
+    }
+
+    // Positional shared cache (no rowid_fn), mutated in place. Only an
+    // ALREADY-built/snapshotted cache qualifies — like C++, never build the shared
+    // cache during a mutation (a filter_eq cursor leaves it unbuilt, and its
+    // iterator rowid is not a reliable cache position).
     if by_rowid
         && def.rowid.is_none()
         && def.use_shared_cache
@@ -2247,28 +2885,21 @@ fn cached_update_reconstruct_and_apply<'a, Row>(
         return Ok(true);
     }
 
-    // Branch 3: trusted rowid resolved via row_lookup.
-    if by_rowid && let Some(mut row) = def.row_lookup.as_ref().and_then(|lookup| lookup(old_rowid))
-    {
-        apply_cached_setters(def, &mut row, args)?;
-        return Ok(true);
-    }
-
-    // Branch 4: NOCHANGE off — reconstruct from the real argv values.
+    // NOCHANGE off — reconstruct from the real argv values.
     if !by_rowid && let Some(mut row) = def.row_populator.as_ref().and_then(|build| build(args)) {
         apply_cached_setters(def, &mut row, args)?;
         return Ok(true);
     }
 
-    // Branch 4b: query-scoped mutation snapshot (positional, frozen for the
-    // statement) — used instead of a rebuild-on-mutated-data for a multi-row UPDATE.
+    // Query-scoped mutation snapshot (positional, frozen for the statement) — used
+    // instead of a rebuild-on-mutated-data for a multi-row UPDATE.
     if let Some(index) = cached_query_scoped_snapshot_index(def, old_rowid) {
         let mut cache = def.shared_cache.borrow_mut();
         apply_cached_setters(def, &mut cache.data[index], args)?;
         return Ok(true);
     }
 
-    // Branch 5: non-shared positional rebuild.
+    // Non-shared positional rebuild.
     if !def.update_from_column_values
         && let Some(mut row) = cached_rebuilt_positional_row(def, state, old_rowid)
     {
@@ -2276,14 +2907,10 @@ fn cached_update_reconstruct_and_apply<'a, Row>(
         return Ok(true);
     }
 
-    // Branch 6: last-resort populator (argv).
+    // Last-resort populator (argv). CONTRACT: when this runs under NOCHANGE (a
+    // positional shared cache not built yet, reached via filter_eq), the populator
+    // must resolve the row from values that are real, not from unchanged columns.
     if let Some(mut row) = def.row_populator.as_ref().and_then(|build| build(args)) {
-        apply_cached_setters(def, &mut row, args)?;
-        return Ok(true);
-    }
-
-    // Branch 7: last-resort row_lookup.
-    if let Some(mut row) = def.row_lookup.as_ref().and_then(|lookup| lookup(old_rowid)) {
         apply_cached_setters(def, &mut row, args)?;
         return Ok(true);
     }
@@ -2291,46 +2918,55 @@ fn cached_update_reconstruct_and_apply<'a, Row>(
     Ok(false)
 }
 
-/// DELETE row reconstruction, mirroring the reference decision tree:
-/// positional shared -> row_lookup (ungated) -> non-shared positional rebuild.
+/// DELETE row reconstruction, mirroring the C++ decision tree: `row_lookup` (the
+/// sole authority when set) -> positional shared -> query-scoped snapshot ->
+/// non-shared positional rebuild. A rowid that resolves no row fails with
+/// `row <id> not found in <table>`; a `delete_row` refusal fails with its reason.
 fn cached_delete_reconstruct<Row>(
     def: &CachedInner<Row>,
     state: &TransactionState,
     old_rowid: i64,
     delete_row: &CachedDelete<Row>,
-) -> Result<bool> {
+) -> Result<()> {
     // Query-scoped tables: freeze the pre-mutation cache for this statement.
     def.ensure_query_scoped_mutation_snapshot(state)?;
-    let by_rowid = cached_reconstruct_by_rowid(def);
+    let delete = |row: &Row| {
+        begin_vtab_callback();
+        if delete_row(row) {
+            Ok(())
+        } else {
+            Err(vtab_callback_failure("cached table delete failed"))
+        }
+    };
 
-    // Branches 1 & 2: positional shared cache (no rowid_fn). Only an already
-    // built/snapshotted cache qualifies — like C++, never build during a mutation.
-    if by_rowid
+    if let Some(row_lookup) = def.row_lookup.as_ref() {
+        return delete(&cached_row_lookup_or_error(def, row_lookup, old_rowid)?);
+    }
+
+    // Positional shared cache (no rowid_fn). Only an already built/snapshotted
+    // cache qualifies — like C++, never build during a mutation.
+    if cached_reconstruct_by_rowid(def)
         && def.rowid.is_none()
         && def.use_shared_cache
         && let Some(index) = cached_shared_positional_index(def, old_rowid)
     {
         let cache = def.shared_cache.borrow();
-        return Ok(delete_row(&cache.data[index]));
+        return delete(&cache.data[index]);
     }
 
-    // Branch 3: row_lookup (not gated on reconstruct_by_rowid for DELETE).
-    if let Some(row) = def.row_lookup.as_ref().and_then(|lookup| lookup(old_rowid)) {
-        return Ok(delete_row(&row));
-    }
-
-    // Branch 3b: query-scoped mutation snapshot (positional, frozen for the statement).
+    // Query-scoped mutation snapshot (positional, frozen for the statement).
     if let Some(index) = cached_query_scoped_snapshot_index(def, old_rowid) {
         let cache = def.shared_cache.borrow();
-        return Ok(delete_row(&cache.data[index]));
+        return delete(&cache.data[index]);
     }
 
-    // Branch 4: non-shared positional rebuild.
+    // Non-shared positional rebuild.
     if let Some(row) = cached_rebuilt_positional_row(def, state, old_rowid) {
-        return Ok(delete_row(&row));
+        return delete(&row);
     }
 
-    Ok(false)
+    begin_vtab_callback();
+    Err(cached_row_not_found(def, old_rowid))
 }
 
 fn cached_shared_row_index<Row>(

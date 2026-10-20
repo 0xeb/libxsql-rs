@@ -31,31 +31,51 @@ pub fn format_url_host(host: &str) -> String {
     }
 }
 
-/// Build a clipboard help blurb describing how to connect to the HTTP server,
-/// including a sample `curl` command. Empty labels fall back to `tool_name`.
+/// The host a client should dial to reach a server bound to `bind_host`,
+/// rendered for a URL. A wildcard bind (`0.0.0.0`, `::`) accepts connections
+/// but is not a dialable address (curl on Windows refuses both), so it is
+/// advertised as the matching loopback; every other host goes through
+/// [`format_url_host`].
+pub fn format_connect_url_host(bind_host: &str) -> String {
+    match normalize_clipboard_host(bind_host).as_str() {
+        "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "[::]" => "[::1]".to_string(),
+        host => format_url_host(host),
+    }
+}
+
+/// Paste-ready instructions for reaching a running HTTP query server, written
+/// for whoever receives them (usually an AI agent): the base URL, a pointer to
+/// `GET /help` (endpoint and schema discovery), and two curl lines -- `/help`,
+/// then a `POST /query` carrying `sample_sql` verbatim as the body
+/// (`--data-binary`, so newlines and a leading `@` survive). `sample_sql` must
+/// not contain double quotes. A non-empty `auth_token` adds the Authorization
+/// header to the query line; `/help` is public and never needs it.
 pub fn build_http_clipboard_payload(
     tool_name: &str,
     host: &str,
     port: u16,
     sample_sql: &str,
-    connect_with_label: &str,
-    server_label: &str,
+    auth_token: &str,
 ) -> String {
-    let connect_label = if connect_with_label.is_empty() {
-        tool_name
+    let base_url = format!("http://{}:{port}", format_connect_url_host(host));
+    let (auth_line, auth_header) = if auth_token.is_empty() {
+        (String::new(), String::new())
     } else {
-        connect_with_label
-    };
-    let rendered_server_label = if server_label.is_empty() {
-        tool_name
-    } else {
-        server_label
+        (
+            "Send the Authorization header shown with every request; \
+             GET / and GET /help work without it.\n"
+                .to_string(),
+            format!(" -H \"Authorization: Bearer {auth_token}\""),
+        )
     };
     format!(
-        "Use {connect_label} to connect to this {rendered_server_label} HTTP server.\n\
-         curl -X POST http://{}:{port}/query -d \"{}\"",
-        format_url_host(host),
-        sample_sql
+        "{tool_name} HTTP server at {base_url}\n\
+         Read GET /help first (endpoints, schema discovery), then send SQL as the \
+         body of POST /query; responses are JSON.\n\
+         {auth_line}\
+         \x20 curl {base_url}/help\n\
+         \x20 curl -X POST {base_url}/query{auth_header} --data-binary \"{sample_sql}\"\n"
     )
 }
 
@@ -65,7 +85,7 @@ pub fn build_mcp_clipboard_payload(server_name: &str, host: &str, port: u16) -> 
     format!(
         "{{\n  \"mcpServers\": {{\n    \"{}\": {{\n      \"url\": \"http://{}:{port}/sse\"\n    }}\n  }}\n}}\n",
         json_escape(server_name),
-        format_url_host(host)
+        format_connect_url_host(host)
     )
 }
 
@@ -129,16 +149,17 @@ pub fn extract_mcp_start_endpoint(output: &str) -> Option<(String, u16)> {
 /// in this banner — matching the C++ reference.
 pub fn format_http_info(port: u16, bind_addr: &str, stop_hint: &str) -> String {
     let rendered_host = format_url_host(bind_addr);
+    let connect_host = format_connect_url_host(bind_addr);
     format!(
         "HTTP server started on port {port}\n\
          URL: http://{rendered_host}:{port}\n\n\
          Endpoints:\n\
-           GET  /help     - API documentation\n\
-           POST /query    - Execute SQL query\n\
-           GET  /status   - Health check\n\
-           POST /shutdown - Stop server\n\n\
+         \x20 GET  /help     - API documentation\n\
+         \x20 POST /query    - Execute SQL query\n\
+         \x20 GET  /status   - Health check\n\
+         \x20 POST /shutdown - Stop server\n\n\
          Example:\n\
-           curl -X POST http://{rendered_host}:{port}/query -d \"SELECT name FROM sqlite_master WHERE type='table' LIMIT 10\"\n\n\
+         \x20 curl -X POST http://{connect_host}:{port}/query --data-binary \"SELECT name FROM sqlite_master WHERE type='table' LIMIT 10\"\n\n\
          {stop_hint}\n"
     )
 }

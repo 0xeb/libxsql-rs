@@ -8,7 +8,7 @@ use crate::error::{Error, Result, Status, sqlite_ok};
 use crate::function::sqlite_error;
 use crate::vtab::WriteSurfaceRegistry;
 use libsqlite3_sys as ffi;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::rc::Rc;
@@ -22,11 +22,19 @@ pub(crate) struct ConnectionInner {
     // being placed in the `Rc`. Dropped with the connection, after `sqlite3_close`
     // has removed the authorizer.
     registry: Box<RefCell<WriteSurfaceRegistry>>,
+    // The registry's virtual-table write counter, held here so reading it never
+    // borrows the registry.
+    vtab_writes: Rc<Cell<u64>>,
 }
 
 impl ConnectionInner {
     pub(crate) fn raw(&self) -> *mut ffi::sqlite3 {
         self.db
+    }
+
+    /// Row writes accepted by this connection's counting virtual tables.
+    pub(crate) fn vtab_write_count(&self) -> u64 {
+        self.vtab_writes.get()
     }
 
     pub(crate) fn write_surface_registry(&self) -> *const RefCell<WriteSurfaceRegistry> {
@@ -174,10 +182,11 @@ impl Statement {
     /// Binds a text value to the 1-based parameter at `index`.
     ///
     /// SQLite copies the string, so the source need not outlive the call.
+    /// The whole string is bound by its length, so an embedded NUL is kept.
     pub fn bind_text(&mut self, index: i32, value: impl AsRef<str>) -> Result<()> {
         self.require_valid()?;
-        let value = CString::new(value.as_ref())?;
-        let len = i32::try_from(value.as_bytes().len()).map_err(|_| {
+        let bytes = value.as_ref().as_bytes();
+        let len = i32::try_from(bytes.len()).map_err(|_| {
             Error::sqlite(
                 ffi::SQLITE_TOOBIG,
                 "text too large to bind (exceeds i32::MAX bytes)",
@@ -187,7 +196,7 @@ impl Statement {
             ffi::sqlite3_bind_text(
                 self.stmt,
                 index,
-                value.as_ptr(),
+                bytes.as_ptr().cast::<std::os::raw::c_char>(),
                 len,
                 ffi::SQLITE_TRANSIENT(),
             )
@@ -206,16 +215,32 @@ impl Statement {
                 "blob too large to bind (exceeds i32::MAX bytes)",
             )
         })?;
-        let rc = unsafe {
-            ffi::sqlite3_bind_blob(
-                self.stmt,
-                index,
-                data.as_ptr().cast::<c_void>(),
-                len,
-                ffi::SQLITE_TRANSIENT(),
-            )
+        // An empty blob is still a blob, never SQL NULL (SQLite reads a null
+        // data pointer as NULL), so bind it as a zero-length blob explicitly.
+        let rc = if data.is_empty() {
+            unsafe { ffi::sqlite3_bind_zeroblob(self.stmt, index, 0) }
+        } else {
+            unsafe {
+                ffi::sqlite3_bind_blob(
+                    self.stmt,
+                    index,
+                    data.as_ptr().cast::<c_void>(),
+                    len,
+                    ffi::SQLITE_TRANSIENT(),
+                )
+            }
         };
         self.set_error(rc)
+    }
+
+    /// Number of placeholders in the statement (`sqlite3_bind_parameter_count`);
+    /// `0` for an invalid statement.
+    pub fn parameter_count(&self) -> i32 {
+        if self.valid() {
+            unsafe { ffi::sqlite3_bind_parameter_count(self.stmt) }
+        } else {
+            0
+        }
     }
 
     /// Advances the statement by one step and reports the outcome.
@@ -246,6 +271,12 @@ impl Statement {
                 StepResult::Error
             }
         }
+    }
+
+    /// The extended SQLite result code of this connection's most recent failed
+    /// call, e.g. right after [`Statement::step`] returned [`StepResult::Error`].
+    pub(crate) fn last_result_code(&self) -> i32 {
+        unsafe { ffi::sqlite3_extended_errcode(self.inner.raw()) }
     }
 
     /// Returns the number of columns in the current result row, or `0` if invalid.
@@ -400,5 +431,10 @@ pub(crate) fn open_connection(path: &str) -> Result<Rc<ConnectionInner>> {
     unsafe {
         crate::vtab::install_authorizer(db, &*registry as *const RefCell<WriteSurfaceRegistry>);
     }
-    Ok(Rc::new(ConnectionInner { db, registry }))
+    let vtab_writes = registry.borrow().vtab_write_counter();
+    Ok(Rc::new(ConnectionInner {
+        db,
+        registry,
+        vtab_writes,
+    }))
 }

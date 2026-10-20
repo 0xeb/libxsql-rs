@@ -37,7 +37,7 @@ jobs:
 
       # `--all-features` enables `bundled-sqlite`, so libsqlite3-sys compiles its
       # vendored SQLite — no system-sqlite dependency on Linux/Windows. This also
-      # compiles the platform-dependent paths (the `%.16g` export formatting and
+      # compiles the platform-dependent paths (round-trip REAL formatting and
       # the sqlite3_vtab_nochange / sqlite3_vtab_rhs_value FFI externs).
       - name: Format
         run: cargo fmt --check --all

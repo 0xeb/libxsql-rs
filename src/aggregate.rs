@@ -7,6 +7,7 @@
 use crate::error::{Error, Result};
 use crate::function::FunctionContext;
 use libsqlite3_sys as ffi;
+use std::any::Any;
 use std::marker::PhantomData;
 use std::os::raw::c_void;
 use std::ptr::NonNull;
@@ -27,31 +28,53 @@ impl<'a> AggregateContext<'a> {
 
     /// Returns a mutable reference to the per-aggregation state of type `T`,
     /// allocating it via `init` on the first call within this aggregation.
-    pub fn state_or_init<T>(&mut self, init: impl FnOnce() -> T) -> Result<&mut T> {
+    pub fn state_or_init<T: 'static>(&mut self, init: impl FnOnce() -> T) -> Result<&mut T> {
         let slot = self.state_slot()?;
         if unsafe { *slot }.is_null() {
-            let boxed = Box::new(init());
+            let boxed: Box<Box<dyn Any>> = Box::new(Box::new(init()));
             unsafe {
                 *slot = Box::into_raw(boxed).cast::<c_void>();
             }
         }
-        let ptr = NonNull::new(unsafe { *slot }.cast::<T>())
-            .ok_or_else(|| Error::Message("aggregate state allocation failed".to_string()))?;
-        Ok(unsafe { ptr.as_ptr().as_mut().expect("non-null aggregate state") })
+        let state = unsafe { &mut *(*slot).cast::<Box<dyn Any>>() };
+        state
+            .downcast_mut::<T>()
+            .ok_or_else(|| Error::Message("aggregate state type mismatch".to_string()))
     }
 
     /// Takes ownership of the per-aggregation state of type `T`, clearing the
-    /// slot; returns `None` if no state was ever initialized. Typically called
-    /// from the final callback.
-    pub fn take_state<T>(&mut self) -> Option<Box<T>> {
-        let slot = self.state_slot().ok()?;
+    /// slot; returns `Ok(None)` if no state was ever initialized. A type
+    /// mismatch returns an error and preserves the existing state. Any state
+    /// left in the slot is dropped after the final callback, including errors
+    /// and panics.
+    pub fn take_state<T: 'static>(&mut self) -> Result<Option<Box<T>>> {
+        let slot = self.state_slot()?;
         let raw = unsafe { *slot };
         if raw.is_null() {
-            return None;
+            return Ok(None);
+        }
+        let state = unsafe { &*raw.cast::<Box<dyn Any>>() };
+        if !state.is::<T>() {
+            return Err(Error::Message("aggregate state type mismatch".to_string()));
         }
         unsafe {
             *slot = std::ptr::null_mut();
-            Some(Box::from_raw(raw.cast::<T>()))
+            let state = *Box::from_raw(raw.cast::<Box<dyn Any>>());
+            Ok(Some(state.downcast::<T>().map_err(|_| {
+                Error::Message("aggregate state type mismatch".to_string())
+            })?))
+        }
+    }
+
+    pub(crate) fn clear_state(&mut self) {
+        if let Ok(slot) = self.state_slot() {
+            let raw = unsafe { *slot };
+            if !raw.is_null() {
+                unsafe {
+                    *slot = std::ptr::null_mut();
+                    drop(Box::from_raw(raw.cast::<Box<dyn Any>>()));
+                }
+            }
         }
     }
 

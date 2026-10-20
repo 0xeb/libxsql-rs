@@ -9,7 +9,7 @@ use crate::error::{Error, Result, sqlite_ok};
 use crate::function::{FunctionArg, FunctionContext, build_args, sqlite_error};
 use crate::script::{ScriptResult, StatementResult};
 use crate::statement::{ConnectionInner, Statement, StepResult, open_connection};
-use crate::value::ValueType;
+use crate::value::{OwnedValue, ValueType};
 use crate::vtab::{CachedTableDef, GeneratorTableDef, TableDef};
 use libsqlite3_sys as ffi;
 use std::cell::RefCell;
@@ -37,6 +37,11 @@ pub struct Row {
     /// `false`. Lets a genuine text value (even "" or "NULL") stay distinct from a
     /// real SQL NULL — mirroring the C++ `xsql::Row` null bitmap.
     pub nulls: Vec<bool>,
+    /// Per-cell SQLite storage class, parallel to `values`, read before the cell
+    /// was converted to text. [`Database`] queries fill it; a row built any other
+    /// way may leave it empty, and [`Row::value_type`] then answers `None`. Lets
+    /// an embedder hand an integer back as an integer, not as its decimal text.
+    pub types: Vec<ValueType>,
 }
 
 impl Row {
@@ -53,6 +58,12 @@ impl Row {
     /// Returns `true` if cell `i` was a SQL NULL (vs a genuine text value).
     pub fn is_null(&self, i: usize) -> bool {
         self.nulls.get(i).copied().unwrap_or(false)
+    }
+
+    /// Returns the storage class of cell `i`, or `None` when it is unknown (out
+    /// of range, or a row built without type tracking).
+    pub fn value_type(&self, i: usize) -> Option<ValueType> {
+        self.types.get(i).copied()
     }
 }
 
@@ -192,6 +203,32 @@ pub enum ScriptExecutionMode {
     ContinueOnError,
 }
 
+/// Flags for [`Database::register_function`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct FunctionFlags(u32);
+
+impl FunctionFlags {
+    /// No flags: the function is not deterministic and runs on every call.
+    pub const NONE: Self = Self(0);
+    /// The function always returns the same result for the same arguments and
+    /// has no side effects, so SQLite may evaluate a constant-argument call once
+    /// and reuse the value (and allow the function in index expressions).
+    pub const DETERMINISTIC: Self = Self(1);
+
+    /// Returns `true` when every flag in `other` is set in `self`.
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for FunctionFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
 /// Owned SQLite database connection with xsql registration helpers.
 pub struct Database {
     inner: Option<Rc<ConnectionInner>>,
@@ -243,6 +280,20 @@ impl Database {
                 self.last_error = err.to_string();
                 Err(err)
             }
+        }
+    }
+
+    /// Invalidates every cached table registered on this connection, exactly as
+    /// a write through each of them would.
+    ///
+    /// For a caller that mutates the engine behind the tables outside SQL; a SQL
+    /// function uses [`FunctionContext::invalidate_cached_tables`]. A scan
+    /// already in flight on a shared-cache table keeps its rows as a snapshot;
+    /// every later probe or statement rebuilds from the source. A no-op on a
+    /// closed database. Mirrors the C++ `Database::invalidate_cached_tables`.
+    pub fn invalidate_cached_tables(&self) {
+        if let Ok(db) = self.raw() {
+            crate::vtab::invalidate_connection_cached_tables(db);
         }
     }
 
@@ -423,7 +474,25 @@ impl Database {
     /// error), while a mutation (including `RETURNING`) reports a timeout error
     /// and rolls back the incomplete statement.
     pub fn query_with_options(&mut self, sql: &str, options: QueryOptions) -> QueryOutcome {
-        self.query_with_options_impl(sql, options, None, true)
+        self.query_with_options_impl(sql, None, options, None, true)
+    }
+
+    /// Runs `sql` with `params` bound to its placeholders, under `options`.
+    ///
+    /// The same timeout, cancellation and partial-result rules as
+    /// [`Database::query_with_options`] apply. `?`, `?NNN`, `:name`, `@name` and
+    /// `$name` placeholders all bind by position, from the first parameter. When
+    /// the number of params differs from the statement's parameter count the
+    /// outcome carries the error `statement has N parameter(s), M value(s) given`
+    /// and the statement does not run. Text binds by its length, so an embedded
+    /// NUL is kept; an empty [`OwnedValue::Blob`] binds a zero-length blob.
+    pub fn query_with_params(
+        &mut self,
+        sql: &str,
+        params: &[OwnedValue],
+        options: QueryOptions,
+    ) -> QueryOutcome {
+        self.query_with_options_impl(sql, Some(params), options, None, true)
     }
 
     /// Step a query while handing each row to `sink` instead of retaining it.
@@ -443,12 +512,13 @@ impl Database {
     where
         F: FnMut(&[String], &Row) -> bool,
     {
-        self.query_with_options_impl(sql, options, Some(&mut sink), false)
+        self.query_with_options_impl(sql, None, options, Some(&mut sink), false)
     }
 
     fn query_with_options_impl(
         &mut self,
         sql: &str,
+        params: Option<&[OwnedValue]>,
         options: QueryOptions,
         mut sink: Option<&mut RowSink<'_>>,
         collect_rows: bool,
@@ -530,6 +600,15 @@ impl Database {
             }
         };
 
+        if let Some(params) = params
+            && let Err(message) = bind_params(&mut stmt, params)
+        {
+            self.last_error.clone_from(&message);
+            outcome.error = Some(message);
+            outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+            return outcome;
+        }
+
         let col_count = stmt.column_count();
         let readonly = stmt.is_readonly();
         let partial_capable = col_count > 0 && readonly;
@@ -595,15 +674,20 @@ impl Database {
                     let mut row = Row {
                         values: Vec::with_capacity(col_count as usize),
                         nulls: Vec::with_capacity(col_count as usize),
+                        types: Vec::with_capacity(col_count as usize),
                     };
                     for col in 0..col_count {
-                        let is_null = stmt.column_is_null(col);
+                        // The storage class first: sqlite3_column_type() is
+                        // undefined once text() has converted the value.
+                        let value_type = ValueType::from_sqlite(stmt.column_type(col));
+                        let is_null = value_type == ValueType::Null;
                         row.values.push(if is_null {
                             String::new()
                         } else {
                             stmt.text(col)
                         });
                         row.nulls.push(is_null);
+                        row.types.push(value_type);
                     }
                     if sink.is_some() && !partial_capable {
                         deferred_sink_rows.push(row);
@@ -745,7 +829,9 @@ impl Database {
         crate::script::run_script(self, script, mode)
     }
 
-    /// Exports the named `tables` to a new SQLite database at `output_path`.
+    /// Exports `tables` (every table when empty) as a replayable SQL script at
+    /// `output_path`; see [`crate::export_tables`], which documents the format
+    /// and how tables that require constraints are skipped or refused.
     pub fn export_tables(
         &mut self,
         tables: &[impl AsRef<str>],
@@ -845,11 +931,25 @@ impl Database {
         Ok(rc)
     }
 
-    /// Registers a deterministic scalar SQL function `name` taking `argc` arguments.
+    /// Registers a scalar SQL function `name` taking `argc` arguments.
+    ///
+    /// With [`FunctionFlags::NONE`] the function is not deterministic, which is
+    /// SQLite's own default: every call runs. That is required for a function
+    /// with side effects or whose result follows state that can change between
+    /// calls (writes, undo/redo, script execution, clocks, random values),
+    /// because SQLite may evaluate a deterministic constant-argument call once
+    /// and reuse the value. A pure function opts in with
+    /// [`FunctionFlags::DETERMINISTIC`].
     ///
     /// Use `argc = -1` for a variadic function. Panics in `function` are caught
     /// and surfaced as a SQL error.
-    pub fn register_function<F>(&mut self, name: &str, argc: i32, function: F) -> Result<()>
+    pub fn register_function<F>(
+        &mut self,
+        name: &str,
+        argc: i32,
+        flags: FunctionFlags,
+        function: F,
+    ) -> Result<()>
     where
         F: for<'a> Fn(&mut FunctionContext<'a>, &[FunctionArg<'a>]) + 'static,
     {
@@ -864,7 +964,12 @@ impl Database {
                 db,
                 name.as_ptr(),
                 argc,
-                ffi::SQLITE_UTF8 | ffi::SQLITE_DETERMINISTIC,
+                ffi::SQLITE_UTF8
+                    | if flags.contains(FunctionFlags::DETERMINISTIC) {
+                        ffi::SQLITE_DETERMINISTIC
+                    } else {
+                        0
+                    },
                 wrapper_ptr,
                 Some(scalar_callback),
                 None,
@@ -948,6 +1053,31 @@ impl Database {
         }
     }
 
+    /// Returns the rows changed by INSERT/UPDATE/DELETE on this connection since
+    /// it opened (`sqlite3_total_changes64`), virtual-table writes included, or
+    /// `0` if closed.
+    pub fn total_changes(&self) -> i64 {
+        match self.raw() {
+            Ok(db) => total_changes(db),
+            Err(_) => 0,
+        }
+    }
+
+    /// Returns the row writes accepted by this connection's virtual tables since
+    /// it opened, or `0` if closed.
+    ///
+    /// Every INSERT, UPDATE or DELETE a table's write callback carried out
+    /// counts, on tables that count as writes (see the builders'
+    /// `counts_as_write`). Temp and ordinary SQLite tables are not included, a
+    /// refused write does not count, and a later `ROLLBACK` does not lower it: a
+    /// host write is not undone by SQLite. Compare two readings to ask "did a
+    /// host-backed table change since X?".
+    pub fn vtab_write_count(&self) -> u64 {
+        self.connection()
+            .map(|connection| connection.vtab_write_count())
+            .unwrap_or(0)
+    }
+
     fn register_builtin_aggregates(&mut self) -> Result<()> {
         self.register_aggregate("blob_concat", 1, blob_concat_step, blob_concat_final)
     }
@@ -967,6 +1097,50 @@ impl Database {
             .filter(|raw| !raw.is_null())
             .ok_or(Error::DatabaseNotOpen)
     }
+}
+
+#[cfg(feature = "bundled-sqlite")]
+fn total_changes(db: *mut ffi::sqlite3) -> i64 {
+    unsafe { ffi::sqlite3_total_changes64(db) }
+}
+
+// The prebuilt bindings for a system SQLite predate sqlite3_total_changes64.
+#[cfg(not(feature = "bundled-sqlite"))]
+fn total_changes(db: *mut ffi::sqlite3) -> i64 {
+    unsafe extern "C" {
+        fn sqlite3_total_changes64(db: *mut ffi::sqlite3) -> i64;
+    }
+    unsafe { sqlite3_total_changes64(db) }
+}
+
+/// Binds `params` to `stmt` by position, refusing a count mismatch.
+fn bind_params(stmt: &mut Statement, params: &[OwnedValue]) -> std::result::Result<(), String> {
+    let expected = stmt.parameter_count();
+    if usize::try_from(expected).ok() != Some(params.len()) {
+        return Err(format!(
+            "statement has {expected} parameter(s), {} value(s) given",
+            params.len()
+        ));
+    }
+    for (offset, param) in params.iter().enumerate() {
+        let index = i32::try_from(offset + 1).unwrap_or(i32::MAX);
+        let bound = match param {
+            OwnedValue::Null => stmt.bind_null(index),
+            OwnedValue::Integer(value) => stmt.bind_int64(index, *value),
+            OwnedValue::Real(value) => stmt.bind_double(index, *value),
+            OwnedValue::Text(value) => stmt.bind_text(index, value),
+            OwnedValue::Blob(value) => stmt.bind_blob(index, value),
+        };
+        if let Err(error) = bound {
+            let message = if stmt.error().is_empty() {
+                error.to_string()
+            } else {
+                stmt.error().to_string()
+            };
+            return Err(format!("cannot bind parameter {index}: {message}"));
+        }
+    }
+    Ok(())
 }
 
 fn has_sql_keyword(sql: &str, keyword: &str) -> bool {
@@ -1431,6 +1605,9 @@ extern "C" fn aggregate_final_callback(ctx: *mut ffi::sqlite3_context) {
     if result.is_err() {
         actx.result_error("xsql aggregate final panicked");
     }
+    if catch_unwind(AssertUnwindSafe(|| actx.clear_state())).is_err() {
+        actx.result_error("xsql aggregate state destructor panicked");
+    }
 }
 
 extern "C" fn destroy_aggregate_wrapper(ptr: *mut std::ffi::c_void) {
@@ -1482,7 +1659,7 @@ fn blob_concat_step(ctx: &mut AggregateContext<'_>, args: &[FunctionArg<'_>]) {
 }
 
 fn blob_concat_final(ctx: &mut AggregateContext<'_>) {
-    let Some(state) = ctx.take_state::<BlobConcatState>() else {
+    let Ok(Some(state)) = ctx.take_state::<BlobConcatState>() else {
         ctx.result_null();
         return;
     };

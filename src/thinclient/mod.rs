@@ -21,22 +21,36 @@ pub(crate) type StatementExecutorFn = dyn Fn(&str, &mut StatementResult) + Send 
 /// Whole-script executor: runs an entire script under caller-owned orchestration.
 pub(crate) type ScriptExecutorFn =
     dyn Fn(&str, &ScriptOptions) -> ScriptResult + Send + Sync + 'static;
+/// Downstream cancellation hook run by `POST /cancel` after the local epoch moves.
+pub(crate) type CancelFn = dyn Fn() -> Result<()> + Send + Sync + 'static;
+/// Chunked-response executor: `(script, options, ndjson, sink)`.
+pub(crate) type StreamingExecutorFn =
+    dyn Fn(&str, &ScriptOptions, bool, &mut StreamSink<'_>) + Send + Sync + 'static;
+
+/// Sink a [`HttpQueryServerConfig::streaming_executor`] writes its output to,
+/// one piece at a time (typically one row). It returns `false` once the client
+/// has disconnected (or an earlier write failed); the executor should then stop
+/// producing output. [`crate::stream_database_script_json`] and
+/// [`crate::stream_database_script_ndjson`] take a sink of exactly this shape.
+pub type StreamSink<'a> = dyn FnMut(&str) -> bool + 'a;
 
 mod cli;
 mod client;
 mod clipboard;
+mod compress;
 mod custom_server;
 mod http_query_server;
 mod json;
+mod streaming;
 
 pub use cli::{CliArgs, CliMode, parse_cli_args};
 pub use client::{ClientConfig, ThinClient};
 pub use clipboard::{
     build_http_clipboard_payload, build_mcp_clipboard_payload, clear_clipboard_copy_override,
     extract_http_start_endpoint, extract_mcp_start_endpoint, extract_url_host_from_output_line,
-    format_http_info, format_http_info_default, format_http_status, format_http_status_default,
-    format_url_host, normalize_clipboard_host, parse_started_port, set_clipboard_copy_override,
-    try_copy_text_to_clipboard_windows,
+    format_connect_url_host, format_http_info, format_http_info_default, format_http_status,
+    format_http_status_default, format_url_host, normalize_clipboard_host, parse_started_port,
+    set_clipboard_copy_override, try_copy_text_to_clipboard_windows,
 };
 pub use custom_server::{Server, ServerConfig};
 pub use http_query_server::{
@@ -46,6 +60,7 @@ pub use json::{
     JsonQueryResult, ThinclientJsonResult, json_escape, make_error_json, make_status_json,
     make_success_json, result_to_json,
 };
+pub use streaming::StreamWriteCoalescer;
 
 #[derive(Debug)]
 pub(crate) struct HttpRequest {

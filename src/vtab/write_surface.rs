@@ -21,10 +21,11 @@
 //! the same error.
 
 use libsqlite3_sys as ffi;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
+use std::rc::Rc;
 
 use super::ffi::unsupported_write_message;
 use crate::error::{Error, Result};
@@ -43,9 +44,18 @@ pub(crate) struct WriteCaps {
 pub(crate) struct WriteSurfaceRegistry {
     table_caps: HashMap<String, WriteCaps>,
     preparing_drop: Option<String>,
+    // The connection's virtual-table write counter (`Database::vtab_write_count`).
+    // Each counting table holds a clone from its xConnect, so a write bumps it
+    // without borrowing this registry.
+    vtab_writes: Rc<Cell<u64>>,
 }
 
 impl WriteSurfaceRegistry {
+    /// The connection's virtual-table write counter, shared with its tables.
+    pub(crate) fn vtab_write_counter(&self) -> Rc<Cell<u64>> {
+        self.vtab_writes.clone()
+    }
+
     /// Record a concrete table from its module's `xCreate`/`xConnect` callback.
     pub(crate) fn connect_table(&mut self, schema: &str, table: &str, caps: WriteCaps) {
         self.table_caps.insert(table_key(schema, table), caps);
@@ -96,6 +106,18 @@ pub(crate) unsafe fn connect_write_surface(
             .connect_table(&schema, &table, caps);
         Ok((schema, table))
     }
+}
+
+/// The write counter a table connected through `registry` bumps, or `None` when
+/// the table opts out (`counts_as_write(false)`) or no registry is attached.
+pub(crate) unsafe fn table_write_counter(
+    registry: *const RefCell<WriteSurfaceRegistry>,
+    counts_as_write: bool,
+) -> Option<Rc<Cell<u64>>> {
+    if !counts_as_write {
+        return None;
+    }
+    unsafe { registry.as_ref() }.map(|registry| registry.borrow().vtab_write_counter())
 }
 
 pub(crate) unsafe fn destroy_write_surface(

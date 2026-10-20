@@ -1011,6 +1011,8 @@ pub fn define_runtime_settings_table(
     let estimate_settings = settings.clone();
     cached_table("runtime_settings")
         .no_shared_cache()
+        // Session settings, not host data: an UPDATE here is not a host write.
+        .counts_as_write(false)
         .estimate_rows(move || estimate_settings.specs().len())
         .stateful_cache_builder(move |state, rows| {
             *rows = row_settings

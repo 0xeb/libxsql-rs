@@ -13,8 +13,8 @@
 //!
 //! ```text
 //! cargo run --example http_server --all-features
-//! curl -s localhost:8077/query -d "SELECT * FROM order_details"
-//! curl -s "localhost:8077/query?format=csv" -d "SELECT * FROM product_revenue"
+//! curl -s localhost:8077/query --data-binary "SELECT * FROM order_details"
+//! curl -s "localhost:8077/query?format=csv" --data-binary "SELECT * FROM product_revenue"
 //! ```
 //!
 //! On startup it runs an in-process [`ThinClient`](libxsql::thinclient::ThinClient)
@@ -339,22 +339,32 @@ mod demo {
         db.register_and_create_generator_table(&series_def)?;
 
         // Custom scalar functions.
-        db.register_function("money", 1, |ctx, args| {
-            if args[0].is_null() {
-                ctx.result_null();
-            } else {
-                ctx.result_text(format!("${:.2}", args[0].as_f64()));
-            }
-        })?;
-        db.register_function("initials", 1, |ctx, args| {
-            let initials: String = args[0]
-                .as_text()
-                .split_whitespace()
-                .filter_map(|word| word.chars().next())
-                .collect::<String>()
-                .to_uppercase();
-            ctx.result_text(&initials);
-        })?;
+        db.register_function(
+            "money",
+            1,
+            libxsql::FunctionFlags::DETERMINISTIC,
+            |ctx, args| {
+                if args[0].is_null() {
+                    ctx.result_null();
+                } else {
+                    ctx.result_text(format!("${:.2}", args[0].as_f64()));
+                }
+            },
+        )?;
+        db.register_function(
+            "initials",
+            1,
+            libxsql::FunctionFlags::DETERMINISTIC,
+            |ctx, args| {
+                let initials: String = args[0]
+                    .as_text()
+                    .split_whitespace()
+                    .filter_map(|word| word.chars().next())
+                    .collect::<String>()
+                    .to_uppercase();
+                ctx.result_text(&initials);
+            },
+        )?;
 
         // Real table + views over the virtual tables.
         db.exec(
@@ -519,14 +529,16 @@ mod demo {
         println!("Functions: money(x), initials(name)");
         println!();
         println!("POST SQL to /query (body = SQL, response = JSON envelope). Examples:");
-        println!("  curl -s localhost:{PORT}/query -d \"SELECT * FROM order_details\"");
+        println!("  curl -s localhost:{PORT}/query --data-binary \"SELECT * FROM order_details\"");
         println!(
-            "  curl -s localhost:{PORT}/query -d \"SELECT n FROM series WHERE start=1 AND stop=5\""
+            "  curl -s localhost:{PORT}/query --data-binary \"SELECT n FROM series WHERE start=1 AND stop=5\""
         );
-        println!("  curl -s localhost:{PORT}/query -d \"SELECT * FROM audit_log LIMIT 3\"");
-        println!("  curl -s localhost:{PORT}/query -d \"SELECT * FROM customer_spend\"");
         println!(
-            "  curl -s \"localhost:{PORT}/query?format=csv\" -d \"SELECT * FROM product_revenue\""
+            "  curl -s localhost:{PORT}/query --data-binary \"SELECT * FROM audit_log LIMIT 3\""
+        );
+        println!("  curl -s localhost:{PORT}/query --data-binary \"SELECT * FROM customer_spend\"");
+        println!(
+            "  curl -s \"localhost:{PORT}/query?format=csv\" --data-binary \"SELECT * FROM product_revenue\""
         );
         println!("  curl -s -X POST localhost:{PORT}/shutdown   # stop the server");
     }

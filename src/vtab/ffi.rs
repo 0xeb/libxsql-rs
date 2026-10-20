@@ -110,12 +110,43 @@ pub(crate) fn parse_col_used(idx_str: *const c_char) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-pub(crate) fn parse_constraint_index_list(idx_str: *const c_char) -> Vec<usize> {
-    c_string_to_string(idx_str)
-        .unwrap_or_default()
+/// Decode a constraint filter's spec-index list, as xBestIndex encoded it, into
+/// exactly one spec index per xFilter argument. xBestIndex set `omit=1` for
+/// every constraint it encoded, so SQLite does not re-check them: an entry that
+/// is not an index below `spec_count`, or a list whose length is not `argc`, is
+/// an error. Silently dropping an argument would widen the result instead of
+/// narrowing it. Mirrors the C++ `detail::resolve_constraint_specs` (messages
+/// included).
+pub(crate) fn resolve_constraint_specs(
+    list: &str,
+    spec_count: usize,
+    argc: usize,
+    table: &str,
+) -> std::result::Result<Vec<usize>, String> {
+    let specs = list
         .split(',')
-        .filter_map(|part| part.parse::<usize>().ok())
-        .collect()
+        .filter(|part| !part.is_empty())
+        .enumerate()
+        .map(|(arg_index, part)| {
+            part.parse::<usize>()
+                .ok()
+                .filter(|&index| index < spec_count)
+                .ok_or_else(|| {
+                    format!(
+                        "constraint filter argument {arg_index} maps to out-of-range spec \
+                         index {part} on table '{table}'"
+                    )
+                })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if specs.len() != argc {
+        return Err(format!(
+            "constraint filter on table '{table}' received {argc} argument(s) for {} \
+             encoded constraint(s)",
+            specs.len()
+        ));
+    }
+    Ok(specs)
 }
 
 pub(crate) fn c_string_to_string(ptr: *const c_char) -> Option<String> {
@@ -218,5 +249,72 @@ pub(crate) unsafe fn finish_cursor_unit(
             (*cursor).pVtab
         };
         finish_vtab_unit(p_vtab, result)
+    }
+}
+
+/// Exact narrowing is valid only for binary comparisons.
+pub(crate) unsafe fn binary_constraint(info: *mut ffi::sqlite3_index_info, index: c_int) -> bool {
+    unsafe extern "C" {
+        fn sqlite3_vtab_collation(
+            info: *mut ffi::sqlite3_index_info,
+            index: c_int,
+        ) -> *const c_char;
+    }
+    let name = unsafe { sqlite3_vtab_collation(info, index) };
+    !name.is_null()
+        && unsafe { CStr::from_ptr(name) }
+            .to_bytes()
+            .eq_ignore_ascii_case(b"BINARY")
+}
+
+#[cfg(test)]
+mod constraint_spec_tests {
+    use super::resolve_constraint_specs;
+
+    #[test]
+    fn spec_list_decodes_one_index_per_argument() {
+        assert_eq!(resolve_constraint_specs("0,2", 3, 2, "t"), Ok(vec![0, 2]));
+        assert_eq!(resolve_constraint_specs("", 2, 0, "t"), Ok(vec![]));
+    }
+
+    #[test]
+    fn spec_list_length_must_match_the_argument_count() {
+        // One entry per argument: a short list is an error, not a truncation,
+        // and so is a long one.
+        assert_eq!(
+            resolve_constraint_specs("0", 2, 2, "g"),
+            Err(
+                "constraint filter on table 'g' received 2 argument(s) for 1 encoded \
+                 constraint(s)"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            resolve_constraint_specs("1,0", 2, 1, "g"),
+            Err(
+                "constraint filter on table 'g' received 1 argument(s) for 2 encoded \
+                 constraint(s)"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn out_of_range_or_garbage_spec_index_is_a_hard_error() {
+        assert_eq!(
+            resolve_constraint_specs("0,5", 2, 2, "intervals"),
+            Err(
+                "constraint filter argument 1 maps to out-of-range spec index 5 on table \
+                 'intervals'"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            resolve_constraint_specs("-1", 2, 1, "g"),
+            Err(
+                "constraint filter argument 0 maps to out-of-range spec index -1 on table 'g'"
+                    .to_string()
+            )
+        );
     }
 }

@@ -4,13 +4,54 @@
 // This file is licensed under the Human-Origin Source License v1.0.
 // See LICENSE.
 
+use super::index_key::exact_i64;
+use super::set_vtab_error;
 use crate::function::{FunctionArg, FunctionContext};
+use crate::value::ValueType;
 use std::ffi::CStr;
 
 type RowGetter<Row> = dyn for<'a> Fn(&mut FunctionContext<'a>, &Row) + 'static;
 type RowSetter<Row> = dyn for<'a> Fn(&mut Row, &FunctionArg<'a>) -> bool + 'static;
 type IndexGetter = dyn for<'a> Fn(&mut FunctionContext<'a>, usize) + 'static;
 type IndexSetter = dyn for<'a> Fn(usize, &FunctionArg<'a>) -> bool + 'static;
+
+/// The integer a typed `INTEGER` (`i64`) column's setter receives: the one
+/// that equals `value` under SQLite's comparison with an INTEGER column
+/// ([`exact_i64`]: `16`, `16.0`, `'16'`, `' 16 '` and `'1e1'` are integers).
+/// SQLite applies no column affinity to the values an UPDATE hands the vtab, so
+/// this is where that spelling becomes the integer. Anything else -- NULL, a
+/// blob, a non-integral or out-of-range real, non-integer text -- sets the
+/// refusal reason (`column "<column>": expected an integer, got ...`) and
+/// returns `None`: the setter does not run.
+pub(super) fn exact_setter_i64(value: &FunctionArg<'_>, column: &str) -> Option<i64> {
+    if let Some(key) = exact_i64(value) {
+        return Some(key);
+    }
+    let got = match value.value_type() {
+        ValueType::Float => "a non-integral or out-of-range real",
+        ValueType::Text => "non-integer text",
+        ValueType::Blob => "a blob",
+        ValueType::Integer | ValueType::Null | ValueType::Other(_) => "NULL",
+    };
+    set_vtab_error(format!(
+        "column \"{column}\": expected an integer, got {got}"
+    ));
+    None
+}
+
+/// [`exact_setter_i64`] for an `i32` setter, which also refuses an exact
+/// integer outside `i32` (`column "<column>": <value> does not fit a 32-bit
+/// integer`).
+pub(super) fn exact_setter_int(value: &FunctionArg<'_>, column: &str) -> Option<i32> {
+    let wide = exact_setter_i64(value, column)?;
+    let narrow = i32::try_from(wide).ok();
+    if narrow.is_none() {
+        set_vtab_error(format!(
+            "column \"{column}\": {wide} does not fit a 32-bit integer"
+        ));
+    }
+    narrow
+}
 
 pub(super) fn row_getter_null<Row>() -> Box<RowGetter<Row>> {
     Box::new(|ctx, _row| ctx.result_null())
@@ -71,18 +112,18 @@ where
     Box::new(move |ctx, row| ctx.result_blob(&getter(row)))
 }
 
-pub(super) fn row_setter_int<Row, S>(setter: S) -> Box<RowSetter<Row>>
+pub(super) fn row_setter_int<Row, S>(column: String, setter: S) -> Box<RowSetter<Row>>
 where
     S: Fn(&mut Row, i32) -> bool + 'static,
 {
-    Box::new(move |row, value| setter(row, value.as_i32()))
+    Box::new(move |row, value| exact_setter_int(value, &column).is_some_and(|v| setter(row, v)))
 }
 
-pub(super) fn row_setter_i64<Row, S>(setter: S) -> Box<RowSetter<Row>>
+pub(super) fn row_setter_i64<Row, S>(column: String, setter: S) -> Box<RowSetter<Row>>
 where
     S: Fn(&mut Row, i64) -> bool + 'static,
 {
-    Box::new(move |row, value| setter(row, value.as_i64()))
+    Box::new(move |row, value| exact_setter_i64(value, &column).is_some_and(|v| setter(row, v)))
 }
 
 pub(super) fn row_setter_text<Row, S>(setter: S) -> Box<RowSetter<Row>>
@@ -154,18 +195,18 @@ where
     Box::new(move |ctx, row| ctx.result_blob(&getter(row)))
 }
 
-pub(super) fn index_setter_int<S>(setter: S) -> Box<IndexSetter>
+pub(super) fn index_setter_int<S>(column: String, setter: S) -> Box<IndexSetter>
 where
     S: Fn(usize, i32) -> bool + 'static,
 {
-    Box::new(move |row, value| setter(row, value.as_i32()))
+    Box::new(move |row, value| exact_setter_int(value, &column).is_some_and(|v| setter(row, v)))
 }
 
-pub(super) fn index_setter_i64<S>(setter: S) -> Box<IndexSetter>
+pub(super) fn index_setter_i64<S>(column: String, setter: S) -> Box<IndexSetter>
 where
     S: Fn(usize, i64) -> bool + 'static,
 {
-    Box::new(move |row, value| setter(row, value.as_i64()))
+    Box::new(move |row, value| exact_setter_i64(value, &column).is_some_and(|v| setter(row, v)))
 }
 
 pub(super) fn index_setter_text<S>(setter: S) -> Box<IndexSetter>

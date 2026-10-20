@@ -271,6 +271,22 @@ pub fn required_eq(
     ConstraintRequest::required(column_name, ConstraintOp::Eq, missing_error)
 }
 
+/// Shorthand for a required greater-than constraint on `column_name`.
+pub fn required_gt(
+    column_name: impl Into<String>,
+    missing_error: impl Into<String>,
+) -> ConstraintRequest {
+    ConstraintRequest::required(column_name, ConstraintOp::Gt, missing_error)
+}
+
+/// Shorthand for a required less-than-or-equal constraint on `column_name`.
+pub fn required_le(
+    column_name: impl Into<String>,
+    missing_error: impl Into<String>,
+) -> ConstraintRequest {
+    ConstraintRequest::required(column_name, ConstraintOp::Le, missing_error)
+}
+
 /// Shorthand for a required `LIKE` constraint on `column_name`.
 pub fn required_like(
     column_name: impl Into<String>,
@@ -377,6 +393,9 @@ pub(crate) struct TransactionLifecycle {
     wrote: Cell<bool>,
     prepared: Cell<bool>,
     savepoints: RefCell<Vec<TransactionSnapshot>>,
+    // The connection's vtab write counter, bumped by every accepted row write;
+    // `None` for a table that does not count as a write.
+    write_counter: Option<Rc<Cell<u64>>>,
 }
 
 impl TransactionLifecycle {
@@ -391,7 +410,15 @@ impl TransactionLifecycle {
             wrote: Cell::new(false),
             prepared: Cell::new(false),
             savepoints: RefCell::new(Vec::new()),
+            write_counter: None,
         })
+    }
+
+    /// Count this table's accepted row writes in `counter` (the connection's
+    /// `vtab_write_count`); `None` keeps them out of it.
+    pub(crate) fn with_write_counter(mut self, counter: Option<Rc<Cell<u64>>>) -> Self {
+        self.write_counter = counter;
+        self
     }
 
     pub(crate) fn begin(&self) {
@@ -411,9 +438,14 @@ impl TransactionLifecycle {
     }
 
     /// Mark a mutation successful. A later write after `xSync` requires prepare again.
+    /// Every call is one row write the table's callback carried out, so it also
+    /// bumps the connection's write counter when the table counts as a write.
     pub(crate) fn mark_written(&self) {
         self.wrote.set(true);
         self.prepared.set(false);
+        if let Some(counter) = self.write_counter.as_ref() {
+            counter.set(counter.get().wrapping_add(1));
+        }
     }
 
     pub(crate) fn sync(&self, hooks: &TransactionHooks) -> Result<()> {
@@ -547,16 +579,19 @@ mod column_helpers;
 mod ffi;
 mod generator;
 mod index;
+mod index_key;
 mod write_surface;
 
+pub(crate) use cached::invalidate_connection_cached_tables;
 pub use cached::{CachedTableBuilder, CachedTableDef, cached_table};
 pub use generator::{GeneratorTableBuilder, GeneratorTableDef, generator_table};
 pub use index::{TableBuilder, TableDef, table};
+pub use index_key::{I64KeyRange, U64Span, exact_i64, exact_text};
 
 pub(crate) use cached::register_cached_table;
 pub(crate) use generator::register_generator_table;
 pub(crate) use index::register_index_table;
 pub(crate) use write_surface::{
     WriteCaps, WriteSurfaceRegistry, clear_authorizer_denial, connect_write_surface,
-    destroy_write_surface, install_authorizer, take_authorizer_denial,
+    destroy_write_surface, install_authorizer, table_write_counter, take_authorizer_denial,
 };

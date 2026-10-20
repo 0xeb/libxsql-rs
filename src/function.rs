@@ -74,16 +74,15 @@ impl<'a> FunctionArg<'a> {
         self.as_f64()
     }
 
-    /// Returns the TEXT argument as a `String`, truncated at the first embedded
-    /// NUL (C-string semantics) with invalid UTF-8 lossily replaced. Use
+    /// Returns the full TEXT argument as a `String`, including embedded NUL,
+    /// with invalid UTF-8 lossily replaced. Use
     /// [`as_text_bytes`](Self::as_text_bytes) for the raw bytes.
     pub fn as_text(&self) -> String {
         self.value.as_text()
     }
 
     /// Raw TEXT bytes (full `sqlite3_value_bytes` length, including any bytes past
-    /// an embedded NUL). Use this when [`as_text`](Self::as_text)'s C-string
-    /// truncation / lossy UTF-8 is not acceptable.
+    /// an embedded NUL). Use this when lossy UTF-8 conversion is not acceptable.
     pub fn as_text_bytes(&self) -> &'a [u8] {
         self.value.as_text_bytes()
     }
@@ -182,16 +181,13 @@ impl<'a> FunctionContext<'a> {
         self.result_f64(value);
     }
 
-    /// Set a TEXT result. Matches the C++ reference's
-    /// `sqlite3_result_text(ctx, val.c_str(), -1, ..)`: an embedded NUL truncates
-    /// the value (C-string semantics) rather than being an error.
+    /// Set a full TEXT result, preserving embedded NUL bytes.
     pub fn result_text(&mut self, value: impl AsRef<str>) {
         if self.raw.is_null() {
             return;
         }
         let bytes = value.as_ref().as_bytes();
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        let Ok(len) = i32::try_from(end) else {
+        let Ok(len) = i32::try_from(bytes.len()) else {
             unsafe { ffi::sqlite3_result_error_toobig(self.raw) };
             return;
         };
@@ -261,6 +257,23 @@ impl<'a> FunctionContext<'a> {
         unsafe { ffi::sqlite3_result_error(self.raw, c_message.as_ptr(), len) };
     }
 
+    /// Invalidates every cached table registered on this function's connection,
+    /// exactly as a write through each of them would.
+    ///
+    /// Call it from a SQL function that mutates the engine state the tables read
+    /// (renames, re-analysis, type changes): such a function holds no table
+    /// handle, and a query-scoped table's rows otherwise live for the whole
+    /// cursor, so later probes of the same statement would see pre-change rows.
+    /// A shared-cache scan already in flight keeps its rows as a snapshot.
+    /// Mirrors the C++ `FunctionContext::invalidate_cached_tables`.
+    pub fn invalidate_cached_tables(&self) {
+        if self.raw.is_null() {
+            return;
+        }
+        let db = unsafe { ffi::sqlite3_context_db_handle(self.raw) };
+        crate::vtab::invalidate_connection_cached_tables(db);
+    }
+
     /// Returns the most recent error message from this context's database handle
     /// (via `sqlite3_errmsg`); empty if unavailable.
     pub fn db_error(&self) -> String {
@@ -284,6 +297,10 @@ impl<'a> FunctionContext<'a> {
     /// result row. The statement is finalized when the call returns. Returns an
     /// error if the database is not open, the SQL fails to prepare/step, or `f`
     /// returns an error.
+    ///
+    /// The nested statement runs inside the enclosing query's budget: it installs
+    /// no deadline of its own, so the enclosing query's timeout and cancellation
+    /// stop it (it then fails with SQLite's interrupt error).
     pub fn query_each<F>(&mut self, sql: &str, mut f: F) -> Result<()>
     where
         F: FnMut(QueryRow<'_>) -> Result<()>,

@@ -125,16 +125,10 @@ impl<'a> ValueRef<'a> {
         unsafe { ffi::sqlite3_value_double(self.raw) }
     }
 
-    /// Text value as a Rust `String`. Matches the C++ reference's
-    /// `std::string(sqlite3_value_text(..))`: truncate at the first embedded NUL
-    /// (C-string semantics). Invalid UTF-8 in the prefix is lossily replaced —
-    /// the one unavoidable deviation, since a Rust `String` must be valid UTF-8.
-    /// Use [`as_text_bytes`](Self::as_text_bytes) / [`as_blob`](Self::as_blob) for
-    /// the raw bytes.
+    /// Full TEXT value as a Rust `String`, including embedded NUL bytes.
+    /// Invalid UTF-8 is lossily replaced; use `as_text_bytes` for original bytes.
     pub fn as_text(&self) -> String {
-        let bytes = self.as_text_bytes();
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        String::from_utf8_lossy(&bytes[..end]).into_owned()
+        String::from_utf8_lossy(self.as_text_bytes()).into_owned()
     }
 
     /// Returns the text as a borrowed [`CStr`] (`sqlite3_value_text`); `None`

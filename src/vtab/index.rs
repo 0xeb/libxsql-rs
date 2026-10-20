@@ -8,7 +8,7 @@ use crate::error::{Error, Result, sqlite_ok};
 use crate::function::{FunctionArg, FunctionContext, build_args};
 use libsqlite3_sys as ffi;
 use std::cell::RefCell;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
@@ -18,10 +18,11 @@ use super::ffi::{
     callback_status, finish_cursor_unit, finish_vtab_unit, quote_identifier, set_vtab_error,
     sqlite3_vtab_nochange, unsupported_delete, unsupported_insert, unsupported_update,
 };
+use super::index_key;
 use super::{
     ColumnType, FILTER_NONE, ModifyHook, RowIterator, TransactionHooks, TransactionLifecycle,
     WriteCaps, WriteSurfaceRegistry, apply_update_columns, begin_vtab_callback,
-    connect_write_surface, destroy_write_surface, vtab_callback_failure,
+    connect_write_surface, destroy_write_surface, table_write_counter, vtab_callback_failure,
 };
 
 type Getter = dyn for<'a> Fn(&mut FunctionContext<'a>, usize) + 'static;
@@ -58,8 +59,48 @@ struct TableInner {
     filters: Vec<FilterDef>,
     before_modify: Option<Box<ModifyHook>>,
     transaction_hooks: TransactionHooks,
+    counts_as_write: bool,
     delete_row: Option<Box<dyn Fn(usize) -> bool + 'static>>,
     insert_row: Option<Box<InsertFn>>,
+}
+
+/// A live (index-based) table's per-statement positional snapshot.
+///
+/// A live table's rowid is a position: the index the row held when the statement
+/// scanned it. SQLite finishes a write statement's scan before its first xUpdate,
+/// so every position it delivers names a row of that scan. A delete removes its
+/// row and moves every later row up one, so after the statement's first delete a
+/// later position no longer names its scanned row in the live sequence. This
+/// ledger records each position the statement deleted and maps a scanned position
+/// to the row's current index by subtracting the deleted positions before it. It
+/// begins empty at the statement's first write and is dropped by the next scan
+/// (xFilter), which starts a new statement. A position the statement already
+/// deleted names no row. Mirrors the C++ `detail::LiveStatementPositions`.
+#[derive(Default)]
+struct LiveStatementPositions {
+    /// Scanned positions this statement deleted, ascending.
+    deleted: Vec<usize>,
+}
+
+impl LiveStatementPositions {
+    fn reset(&mut self) {
+        self.deleted.clear();
+    }
+
+    /// The current index of the row the statement scanned at `position`, or
+    /// `None` when the statement already deleted that row.
+    fn current_index(&self, position: usize) -> Option<usize> {
+        match self.deleted.binary_search(&position) {
+            Ok(_) => None,
+            Err(before) => Some(position - before),
+        }
+    }
+
+    fn record_delete(&mut self, position: usize) {
+        if let Err(at) = self.deleted.binary_search(&position) {
+            self.deleted.insert(at, position);
+        }
+    }
 }
 
 impl TableInner {
@@ -134,6 +175,7 @@ pub fn table(name: impl Into<String>) -> TableBuilder {
         filters: Vec::new(),
         before_modify: None,
         transaction_hooks: TransactionHooks::default(),
+        counts_as_write: true,
         delete_row: None,
         insert_row: None,
     }
@@ -148,6 +190,7 @@ pub struct TableBuilder {
     filters: Vec<FilterDef>,
     before_modify: Option<Box<ModifyHook>>,
     transaction_hooks: TransactionHooks,
+    counts_as_write: bool,
     delete_row: Option<Box<dyn Fn(usize) -> bool + 'static>>,
     insert_row: Option<Box<InsertFn>>,
 }
@@ -184,6 +227,15 @@ impl TableBuilder {
     /// Install the complete SQLite transaction lifecycle for this table.
     pub fn transaction_hooks(mut self, transaction_hooks: TransactionHooks) -> Self {
         self.transaction_hooks = transaction_hooks;
+        self
+    }
+
+    /// Whether this table's row writes bump the connection's
+    /// [`Database::vtab_write_count`](crate::Database::vtab_write_count)
+    /// (default `true`). A session or bookkeeping table (settings, checkpoints,
+    /// previews) passes `false`, so writing it does not read as a host change.
+    pub fn counts_as_write(mut self, counts_as_write: bool) -> Self {
+        self.counts_as_write = counts_as_write;
         self
     }
 
@@ -271,31 +323,47 @@ impl TableBuilder {
 
     /// Add a writable `INTEGER` (`i32`) column with a getter and a setter; the
     /// setter returns false to reject the write.
+    ///
+    /// The setter receives only the integer the written value equals under
+    /// SQLite's INTEGER comparison ([`exact_i64`](crate::exact_i64): `16`,
+    /// `16.0` and `'16'` all arrive as 16). NULL, a blob, `16.5`, `'0x10'` or
+    /// `'abc'` refuse the write with `column "<name>": expected an integer, got
+    /// ...` and the setter does not run.
+    /// An integer outside `i32` is refused too (`column "<name>": <value> does
+    /// not fit a 32-bit integer`).
     pub fn column_int_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(usize) -> i32 + 'static,
         S: Fn(usize, i32) -> bool + 'static,
     {
+        let name = name.into();
         self.add_column(
-            name,
+            name.clone(),
             ColumnType::Integer,
             column_helpers::index_getter_int(getter),
-            Some(column_helpers::index_setter_int(setter)),
+            Some(column_helpers::index_setter_int(name, setter)),
         )
     }
 
     /// Add a writable `INTEGER` (`i64`) column with a getter and a setter; the
     /// setter returns false to reject the write.
+    ///
+    /// The setter receives only the integer the written value equals under
+    /// SQLite's INTEGER comparison ([`exact_i64`](crate::exact_i64): `16`,
+    /// `16.0` and `'16'` all arrive as 16). NULL, a blob, `16.5`, `'0x10'` or
+    /// `'abc'` refuse the write with `column "<name>": expected an integer, got
+    /// ...` and the setter does not run.
     pub fn column_i64_rw<G, S>(self, name: impl Into<String>, getter: G, setter: S) -> Self
     where
         G: Fn(usize) -> i64 + 'static,
         S: Fn(usize, i64) -> bool + 'static,
     {
+        let name = name.into();
         self.add_column(
-            name,
+            name.clone(),
             ColumnType::Integer,
             column_helpers::index_getter_i64(getter),
-            Some(column_helpers::index_setter_i64(setter)),
+            Some(column_helpers::index_setter_i64(name, setter)),
         )
     }
 
@@ -360,7 +428,11 @@ impl TableBuilder {
     }
 
     /// Make the table deletable via a callback that deletes the row at the given
-    /// index.
+    /// current index. In a multi-row DELETE the index is already adjusted for the
+    /// rows the statement deleted before it: a row the statement scanned at
+    /// position `p` arrives as `p` minus the rows deleted at earlier positions, so
+    /// a callback that erases by index removes exactly the rows the statement
+    /// matched. Column setters receive the same current index.
     pub fn deletable<F>(mut self, delete_row: F) -> Self
     where
         F: Fn(usize) -> bool + 'static,
@@ -381,6 +453,11 @@ impl TableBuilder {
 
     /// Register an equality-pushdown filter on `column_name` backed by a
     /// [`RowIterator`] factory keyed by an `i64` value.
+    ///
+    /// The constraint is omitted (SQLite trusts the rows), so the value is compared
+    /// the way SQLite compares an INTEGER column: the factory is called only with the
+    /// integer that equals it (`10`, `10.0`, `'10'`), and a value no integer equals
+    /// (`10.5`, `'a'`, NULL, a blob) yields no rows without calling it.
     pub fn filter_eq<F>(
         self,
         column_name: impl AsRef<str>,
@@ -395,12 +472,18 @@ impl TableBuilder {
             column_name.as_ref(),
             estimated_cost,
             estimated_rows,
-            move |value| factory(value.as_i64()),
+            move |value| match index_key::exact_i64(value) {
+                Some(key) => factory(key),
+                None => Box::new(index_key::NoRows),
+            },
         )
     }
 
     /// Register an equality-pushdown filter on `column_name` backed by a
     /// [`RowIterator`] factory keyed by a text value.
+    ///
+    /// The constraint is omitted, so NULL (which equals nothing) and a blob (which
+    /// never equals text) yield no rows without calling the factory.
     pub fn filter_eq_text<F>(
         self,
         column_name: impl AsRef<str>,
@@ -415,15 +498,16 @@ impl TableBuilder {
             column_name.as_ref(),
             estimated_cost,
             estimated_rows,
-            move |value| {
-                let text = value.as_c_str().map(CStr::to_string_lossy);
-                factory(text.as_deref().unwrap_or(""))
+            move |value| match index_key::exact_text(value) {
+                Some(text) => factory(&text),
+                None => Box::new(index_key::NoRows),
             },
         )
     }
 
     /// Register an equality-pushdown filter on `column_name` that returns the
-    /// matching row indices.
+    /// matching row indices. Values are compared like [`filter_eq`](Self::filter_eq):
+    /// the factory sees only an integer that equals the constraint value.
     pub fn filter_eq_indices<F>(
         self,
         column_name: impl AsRef<str>,
@@ -438,12 +522,13 @@ impl TableBuilder {
             column_name.as_ref(),
             estimated_cost,
             estimated_rows,
-            move |value| factory(value.as_i64()),
+            move |value| index_key::exact_i64(value).map_or_else(Vec::new, &factory),
         )
     }
 
     /// Register an equality-pushdown filter on `column_name` (text key) that
-    /// returns the matching row indices.
+    /// returns the matching row indices. NULL and blob values yield no rows
+    /// without calling the factory, as in [`filter_eq_text`](Self::filter_eq_text).
     pub fn filter_eq_text_indices<F>(
         self,
         column_name: impl AsRef<str>,
@@ -458,10 +543,7 @@ impl TableBuilder {
             column_name.as_ref(),
             estimated_cost,
             estimated_rows,
-            move |value| {
-                let text = value.as_c_str().map(CStr::to_string_lossy);
-                factory(text.as_deref().unwrap_or(""))
-            },
+            move |value| index_key::exact_text(value).map_or_else(Vec::new, |text| factory(&text)),
         )
     }
 
@@ -482,6 +564,7 @@ impl TableBuilder {
                 filters: self.filters,
                 before_modify: self.before_modify,
                 transaction_hooks: self.transaction_hooks,
+                counts_as_write: self.counts_as_write,
                 delete_row: self.delete_row,
                 insert_row: self.insert_row,
             }),
@@ -571,6 +654,7 @@ struct Vtab {
     registry: *const RefCell<WriteSurfaceRegistry>,
     schema_name: String,
     table_name: String,
+    positions: RefCell<LiveStatementPositions>,
 }
 
 #[repr(C)]
@@ -675,7 +759,10 @@ unsafe extern "C" fn vtab_connect(
             if !sqlite_ok(rc) {
                 return Err(Error::sqlite(rc, crate::function::sqlite_error(db)));
             }
-            let transaction = TransactionLifecycle::new(&state.def.transaction_hooks)?;
+            let transaction =
+                TransactionLifecycle::new(&state.def.transaction_hooks)?.with_write_counter(
+                    table_write_counter(state.registry, state.def.counts_as_write),
+                );
             let (schema_name, table_name) =
                 connect_write_surface(state.registry, argc, argv, state.caps.clone())?;
             let vtab = Box::new(Vtab {
@@ -685,6 +772,7 @@ unsafe extern "C" fn vtab_connect(
                 registry: state.registry,
                 schema_name,
                 table_name,
+                positions: RefCell::new(LiveStatementPositions::default()),
             });
             let vtab_ptr = Box::into_raw(vtab);
             *pp_vtab = &mut (*vtab_ptr).base;
@@ -763,6 +851,10 @@ unsafe extern "C" fn vtab_filter(
                 .cast::<Cursor>()
                 .as_mut()
                 .ok_or_else(|| Error::Message("xsql cursor is null".to_string()))?;
+            // A scan starts a new statement: drop the last statement's positions.
+            if let Some(vtab) = cursor.base.pVtab.cast::<Vtab>().as_ref() {
+                vtab.positions.borrow_mut().reset();
+            }
             cursor.idx = 0;
             cursor.total = 0;
             cursor.indices = None;
@@ -920,7 +1012,7 @@ unsafe extern "C" fn vtab_best_index(
 
             for i in 0..info.nConstraint {
                 let constraint = &*info.aConstraint.add(i as usize);
-                if constraint.usable == 0 {
+                if constraint.usable == 0 || !super::ffi::binary_constraint(info, i) {
                     continue;
                 }
                 if constraint.op as i32 != ffi::SQLITE_INDEX_CONSTRAINT_EQ {
@@ -964,6 +1056,11 @@ unsafe extern "C" fn vtab_best_index(
     }
 }
 
+/// A position the statement already deleted names no row.
+fn live_row_not_found(def: &TableInner, rowid: i64) -> Error {
+    Error::Message(format!("row {rowid} not found in {}", def.name))
+}
+
 unsafe extern "C" fn vtab_update(
     p_vtab: *mut ffi::sqlite3_vtab,
     argc: c_int,
@@ -991,10 +1088,15 @@ unsafe extern "C" fn vtab_update(
                 if raw_rowid < 0 {
                     return Err(Error::Message("virtual table delete failed".to_string()));
                 }
+                let position = raw_rowid as usize;
+                let Some(index) = vtab.positions.borrow().current_index(position) else {
+                    return Err(live_row_not_found(&vtab.def, raw_rowid));
+                };
                 vtab.transaction.touch();
                 call_modify_hook(&vtab.def, &format!("DELETE FROM {}", vtab.def.name));
                 begin_vtab_callback();
-                if delete_row(raw_rowid as usize) {
+                if delete_row(index) {
+                    vtab.positions.borrow_mut().record_delete(position);
                     vtab.transaction.mark_written();
                     return Ok(ffi::SQLITE_OK);
                 }
@@ -1021,9 +1123,12 @@ unsafe extern "C" fn vtab_update(
                         "virtual table update failed: negative rowid".to_string(),
                     ));
                 }
+                let Some(old_rowid) = vtab.positions.borrow().current_index(raw_rowid as usize)
+                else {
+                    return Err(live_row_not_found(&vtab.def, raw_rowid));
+                };
                 vtab.transaction.touch();
                 call_modify_hook(&vtab.def, &format!("UPDATE {}", vtab.def.name));
-                let old_rowid = raw_rowid as usize;
                 // A row here is always resolved by rowid, so unchanged columns arrive
                 // as NOCHANGE -- always NOCHANGE-eligible.
                 let args = build_args(argc - 2, argv.add(2));

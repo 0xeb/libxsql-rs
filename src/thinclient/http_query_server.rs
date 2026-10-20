@@ -6,8 +6,8 @@
 
 use crate::{
     Error, Result, ScriptOptions, ScriptResult, json_to_script_result, run_script_with_executor,
-    script_result_to_csv, script_result_to_json_with_sql, script_result_to_text,
-    script_result_to_tsv,
+    script_result_to_csv, script_result_to_json_with_sql, script_result_to_jsonl,
+    script_result_to_text, script_result_to_tsv,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -22,10 +22,13 @@ use tiny_http::{
 };
 
 use super::clipboard::format_url_host;
+use super::compress;
 use super::json::{json_error, json_error_with_hint};
+use super::streaming::{StreamJob, respond_streaming};
 use super::{
-    DurationFn, HttpRequest, InterruptFn, QueryFn, RouteFn, ScriptExecutorFn, SizeFn,
-    StatementExecutorFn, StatusFn, bind_address_port, ensure_secure_bind, io_error, split_target,
+    CancelFn, DurationFn, HttpRequest, InterruptFn, QueryFn, RouteFn, ScriptExecutorFn, SizeFn,
+    StatementExecutorFn, StatusFn, StreamingExecutorFn, bind_address_port, ensure_secure_bind,
+    io_error, split_target,
 };
 
 /// HTTP query server settings.
@@ -97,6 +100,37 @@ pub struct HttpQueryServerConfig {
     /// before the body is read. `0` disables the limit. Defaults to 64 MiB,
     /// matching the C++ `http_query_server_config::max_request_body_bytes`.
     pub max_request_body_bytes: usize,
+    /// Optional out-of-band cancellation hook. `POST /cancel` advances the local
+    /// cooperative-cancel epoch first, then calls this so an adapter blocked
+    /// inside a downstream call (an RPC to an analysis engine) can forward the
+    /// cancellation without waiting for that call to return. An `Err` (or a
+    /// panic) turns the reply into `502` naming the failure: the local epoch
+    /// moved, but the downstream work may still be running. The hook must be
+    /// thread-safe and must not block beyond its own bounded control request.
+    ///
+    /// Only `POST /cancel` calls it, and only when a
+    /// [`Self::script_executor`] is set (otherwise `/cancel` is a 409).
+    /// [`HttpQueryServerHandle::cancel`] moves the local epoch only; an
+    /// embedder that cancels in-process already owns the downstream side.
+    pub cancel_fn: Option<Arc<CancelFn>>,
+    /// Optional chunked-response executor, for an engine that can stream a
+    /// result row by row with bounded memory instead of building a whole
+    /// [`ScriptResult`] first. It receives `(script, options, ndjson, sink)` and
+    /// writes its output through the [`StreamSink`](super::StreamSink);
+    /// [`crate::stream_database_script_json`] and
+    /// [`crate::stream_database_script_ndjson`] fit it directly.
+    ///
+    /// Used only when a `POST /query` sends `X-XSQL-Stream: 1` (or `true`) for the
+    /// JSON envelope streamed row by row, or `X-XSQL-Stream: ndjson` for one JSON
+    /// object per line, and only outside [`Self::queue_mode`]. Otherwise the
+    /// header is ignored and the request takes the materialized executors. While
+    /// streaming, `?format=` must be `json`, or `jsonl` with an `ndjson` stream;
+    /// anything else is a 400 before the executor runs. The response is sent
+    /// chunked (`application/json` or `application/x-ndjson`), its writes
+    /// coalesced into 64 KiB batches ([`super::StreamWriteCoalescer`]), and
+    /// [`Self::serialize_requests`] holds its lock until the stream ends.
+    /// Takes precedence over every other executor for a streaming request.
+    pub streaming_executor: Option<Arc<StreamingExecutorFn>>,
 }
 
 impl Default for HttpQueryServerConfig {
@@ -124,6 +158,8 @@ impl Default for HttpQueryServerConfig {
             script_executor: None,
             serialize_requests: false,
             max_request_body_bytes: 64 * 1024 * 1024,
+            cancel_fn: None,
+            streaming_executor: None,
         }
     }
 }
@@ -380,7 +416,8 @@ impl HttpQueryServerHandle {
     ///
     /// This is effective only when a script executor is configured; statement
     /// executors and the legacy string callback have no in-flight cancellation
-    /// seam.
+    /// seam. Unlike `POST /cancel`, this does not run
+    /// [`HttpQueryServerConfig::cancel_fn`]: it moves the local epoch only.
     pub fn cancel(&self) -> bool {
         if self.script_executor.is_none() {
             return false;
@@ -755,17 +792,25 @@ fn handle_connection(
             request,
             200,
             "text/plain",
-            &root_welcome(&config.tool_name, local_addr.port()),
+            &root_welcome(
+                &config.tool_name,
+                local_addr.port(),
+                config.script_executor.is_some(),
+            ),
         ),
         ("GET", "/help") => respond(request, 200, "text/plain", &config.help_text),
         ("POST", "/query") => {
-            let response = handle_query(config, &executor, &shutdown, &cancel_epoch, &req);
-            respond(
-                request,
-                response.status,
-                &response.content_type,
-                &response.body,
-            )
+            match handle_query(config, &executor, &shutdown, &cancel_epoch, &req) {
+                QueryReply::Buffered(response) => respond(
+                    request,
+                    response.status,
+                    &response.content_type,
+                    &response.body,
+                ),
+                // The serialize guard (if any) lives in `stream` and is dropped
+                // only after the executor has finished streaming.
+                QueryReply::Stream(stream) => respond_streaming(request, &stream.job),
+            }
         }
         ("GET", "/status") => match status_json(config) {
             Ok(body) => respond(request, 200, "application/json", &body),
@@ -786,6 +831,16 @@ fn handle_connection(
                 );
             }
             cancel_epoch.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = run_cancel_hook(config) {
+                return respond(
+                    request,
+                    502,
+                    "application/json",
+                    &json_error(format!(
+                        "local cancellation requested, but downstream propagation failed{error}"
+                    )),
+                );
+            }
             respond(
                 request,
                 200,
@@ -854,18 +909,36 @@ pub(crate) fn to_http_request(request: &mut TinyRequest) -> HttpRequest {
     }
 }
 
-/// Send a `tiny_http` response with the given status, `Content-Type`, and body.
+/// A `Content-Type` response header.
+pub(crate) fn content_type_header(content_type: &str) -> Result<TinyHeader> {
+    TinyHeader::from_bytes(b"Content-Type".as_slice(), content_type.as_bytes())
+        .map_err(|_| Error::Message("invalid content-type header".to_string()))
+}
+
+/// Send a `tiny_http` response with the given status, `Content-Type`, and body,
+/// gzip'd when the client accepts it and the media type is compressible. Every
+/// route of both thinclient servers answers through here.
 pub(crate) fn respond(
     request: TinyRequest,
     status: u16,
     content_type: &str,
     body: &str,
 ) -> Result<()> {
-    let header = TinyHeader::from_bytes(b"Content-Type".as_slice(), content_type.as_bytes())
-        .map_err(|_| Error::Message("invalid content-type header".to_string()))?;
-    let response = TinyResponse::from_string(body)
+    let compressible = compress::can_compress_content_type(content_type);
+    let gzip = compressible && compress::accepts_gzip(request.headers());
+    let data = if gzip {
+        compress::gzip(body.as_bytes()).map_err(io_error)?
+    } else {
+        body.as_bytes().to_vec()
+    };
+    let mut response = TinyResponse::from_data(data)
         .with_status_code(status)
-        .with_header(header);
+        .with_header(content_type_header(content_type)?);
+    if compressible {
+        for header in compress::encoding_headers(gzip) {
+            response.add_header(header);
+        }
+    }
     request.respond(response).map_err(io_error)
 }
 
@@ -875,12 +948,61 @@ struct QueryHttpResponse {
     body: String,
 }
 
-/// Render a [`ScriptResult`] per the `format` query param (json/text/csv/tsv).
+/// What `/query` resolved to: a materialized response, or a stream to run.
+enum QueryReply<'a> {
+    Buffered(QueryHttpResponse),
+    Stream(StreamReply<'a>),
+}
+
+struct StreamReply<'a> {
+    job: StreamJob,
+    /// Held for the whole stream when `serialize_requests` is set.
+    _guard: Option<SerializeGuard<'a>>,
+}
+
+impl From<QueryHttpResponse> for QueryReply<'_> {
+    fn from(response: QueryHttpResponse) -> Self {
+        Self::Buffered(response)
+    }
+}
+
+/// Parse `X-XSQL-Timeout: <ms>` the way the C++ server's `std::stol` does:
+/// leading whitespace, an optional sign, then digits, with any trailing text
+/// ignored. Nonnegative values clamp to i32::MAX; negatives and unparsable values are ignored.
+fn parse_timeout_header(value: &str) -> Option<u64> {
+    let text = value.trim_start();
+    let (negative, digits) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let end = digits
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    let magnitude = digits[..end].bytes().fold(0_u64, |value, digit| {
+        (value * 10 + u64::from(digit - b'0')).min(i32::MAX as u64)
+    });
+    if negative && magnitude != 0 {
+        return None;
+    }
+    Some(magnitude)
+}
+
+/// The `?format=` values `/query` accepts; anything else is a 400.
+const QUERY_FORMATS: [&str; 5] = ["json", "jsonl", "text", "csv", "tsv"];
+
+/// Render a [`ScriptResult`] per the `format` query param
+/// (json/jsonl/text/csv/tsv; validated against [`QUERY_FORMATS`] on receipt).
 fn format_script_result(result: &ScriptResult, format: &str, include_sql: bool) -> Result<String> {
     Ok(match format {
         "text" => script_result_to_text(result),
         "csv" => script_result_to_csv(result),
         "tsv" => script_result_to_tsv(result),
+        "jsonl" => script_result_to_jsonl(result),
         _ => script_result_to_json_with_sql(result, include_sql)?,
     })
 }
@@ -892,6 +1014,7 @@ fn content_type_for(format: &str) -> &'static str {
         "text" => "text/plain",
         "csv" => "text/csv",
         "tsv" => "text/tab-separated-values",
+        "jsonl" => "application/x-ndjson",
         _ => "application/json",
     }
 }
@@ -978,17 +1101,19 @@ fn resolve_query_sql(
 }
 
 /// Resolve `/query` into (sql, opts, format) and dispatch by execution mode.
-fn handle_query(
+fn handle_query<'a>(
     config: &HttpQueryServerConfig,
-    executor: &QueryExecutor,
+    executor: &'a QueryExecutor,
     shutdown: &AtomicBool,
     cancel_epoch: &Arc<AtomicU64>,
     request: &HttpRequest,
-) -> QueryHttpResponse {
-    let json_response = |status: u16, body: String| QueryHttpResponse {
-        status,
-        content_type: "application/json".to_string(),
-        body,
+) -> QueryReply<'a> {
+    let json_response = |status: u16, body: String| {
+        QueryReply::Buffered(QueryHttpResponse {
+            status,
+            content_type: "application/json".to_string(),
+            body,
+        })
     };
     if shutdown.load(Ordering::SeqCst) {
         return json_response(503, json_error("HTTP server stopped"));
@@ -999,6 +1124,16 @@ fn handle_query(
         .filter(|format| !format.is_empty())
         .unwrap_or("json")
         .to_string();
+    // An unrecognized value is a 400, never a silent fallback to json (C++
+    // http_query_server, same message).
+    if !QUERY_FORMATS.contains(&format.as_str()) {
+        return json_response(
+            400,
+            json_error(format!(
+                "unrecognized ?format '{format}' (expected json, jsonl, text, csv, or tsv)"
+            )),
+        );
+    }
 
     let mut opts = ScriptOptions::default();
     // The /cancel epoch snapshot lives in a shared cell armed at EXECUTION start
@@ -1024,51 +1159,64 @@ fn handle_query(
     if request.param("include_sql") == Some("1") {
         opts.include_sql = true;
     }
+    // Per-request timeout override for every executor (`0` = no limit). Absent
+    // or invalid leaves the ScriptOptions default, so a tool with its own
+    // server-side default applies it when it sees `timeout_ms == 0`.
+    if let Some(timeout_ms) = request
+        .header("x-xsql-timeout")
+        .and_then(|value| parse_timeout_header(&value))
+    {
+        opts.timeout_ms = timeout_ms;
+    }
+
+    // Real chunked streaming: only with a streaming executor, only outside
+    // queue mode, and only when the client opts in through X-XSQL-Stream.
+    let stream_header = request.header("x-xsql-stream").unwrap_or_default();
+    let stream_ndjson = stream_header == "ndjson";
+    let streaming_executor = config
+        .streaming_executor
+        .as_ref()
+        .filter(|_| !config.queue_mode)
+        .filter(|_| stream_ndjson || stream_header == "1" || stream_header == "true");
+    if streaming_executor.is_some() && !(format == "json" || (format == "jsonl" && stream_ndjson)) {
+        // The stream is either the JSON envelope or NDJSON; any other ?format=
+        // would be silently ignored, so it is rejected before execution.
+        return json_response(
+            400,
+            json_error(format!(
+                "?format={format} is incompatible with X-XSQL-Stream: {stream_header} \
+                 (streaming only supports json, or jsonl with X-XSQL-Stream: ndjson \
+                 -- drop ?format= or X-XSQL-Stream to use the other)"
+            )),
+        );
+    }
 
     match executor {
-        QueryExecutor::Queue(queue) => {
-            queue.enqueue_and_wait(&sql_text, &opts, &format, config, shutdown, cancel_cell)
-        }
+        QueryExecutor::Queue(queue) => queue
+            .enqueue_and_wait(&sql_text, &opts, &format, config, shutdown, cancel_cell)
+            .into(),
         QueryExecutor::Direct { query, gate } => {
-            let _guard = match gate {
-                Some(gate) => {
-                    let timeout = config
-                        .queue_admission_timeout_fn
-                        .as_ref()
-                        .map(|timeout| timeout())
-                        .unwrap_or(config.queue_admission_timeout);
-                    let max_queue = config
-                        .max_queue_fn
-                        .as_ref()
-                        .map(|max_queue| max_queue())
-                        .unwrap_or(config.max_queue);
-                    match gate.acquire(timeout, max_queue) {
-                        Ok(guard) => Some(guard),
-                        Err(Admit::QueueFull) => {
-                            return json_response(
-                                503,
-                                json_error_with_hint(
-                                    "Queue full",
-                                    "Reduce concurrency or increase max_queue",
-                                ),
-                            );
-                        }
-                        Err(Admit::Timeout) => {
-                            return json_response(
-                                408,
-                                json_error_with_hint(
-                                    "Request timed out while waiting for serialization",
-                                    "Reduce concurrency or increase queue_admission_timeout",
-                                ),
-                            );
-                        }
-                    }
-                }
+            let guard = match gate {
+                Some(gate) => match admit(config, gate) {
+                    Ok(guard) => Some(guard),
+                    Err(response) => return response.into(),
+                },
                 None => None,
             };
             // Arm the /cancel snapshot at execution start (a /cancel that landed
             // while waiting on the serialize gate must not abort this request).
             cancel_cell.store(cancel_epoch.load(Ordering::SeqCst), Ordering::SeqCst);
+            if let Some(streaming_executor) = streaming_executor {
+                return QueryReply::Stream(StreamReply {
+                    job: StreamJob {
+                        executor: streaming_executor.clone(),
+                        sql: sql_text,
+                        opts,
+                        ndjson: stream_ndjson,
+                    },
+                    _guard: guard,
+                });
+            }
             match render_query(
                 config.script_executor.as_ref(),
                 config.statement_executor.as_ref(),
@@ -1077,15 +1225,51 @@ fn handle_query(
                 &opts,
                 &format,
             ) {
-                Ok(body) => QueryHttpResponse {
+                Ok(body) => QueryReply::Buffered(QueryHttpResponse {
                     status: 200,
                     content_type: content_type_for(&format).to_string(),
                     body,
-                },
+                }),
                 Err(err) => json_response(500, json_error(err.to_string())),
             }
         }
     }
+}
+
+/// Take the `serialize_requests` permit, or the 503/408 response that refuses it.
+fn admit<'a>(
+    config: &HttpQueryServerConfig,
+    gate: &'a SerializeGate,
+) -> std::result::Result<SerializeGuard<'a>, QueryHttpResponse> {
+    let timeout = config
+        .queue_admission_timeout_fn
+        .as_ref()
+        .map(|timeout| timeout())
+        .unwrap_or(config.queue_admission_timeout);
+    let max_queue = config
+        .max_queue_fn
+        .as_ref()
+        .map(|max_queue| max_queue())
+        .unwrap_or(config.max_queue);
+    let refusal = |status, body| QueryHttpResponse {
+        status,
+        content_type: "application/json".to_string(),
+        body,
+    };
+    gate.acquire(timeout, max_queue)
+        .map_err(|admit| match admit {
+            Admit::QueueFull => refusal(
+                503,
+                json_error_with_hint("Queue full", "Reduce concurrency or increase max_queue"),
+            ),
+            Admit::Timeout => refusal(
+                408,
+                json_error_with_hint(
+                    "Request timed out while waiting for serialization",
+                    "Reduce concurrency or increase queue_admission_timeout",
+                ),
+            ),
+        })
 }
 
 fn process_queued_command(
@@ -1148,6 +1332,28 @@ fn process_queued_command(
     true
 }
 
+/// Run the configured downstream cancel hook. `None` means it succeeded (or
+/// none is set); `Some(detail)` is the `": <reason>"` suffix for the 502 body
+/// (empty when a panic carried no message).
+fn run_cancel_hook(config: &HttpQueryServerConfig) -> Option<String> {
+    let hook = config.cancel_fn.as_ref()?;
+    match catch_unwind(AssertUnwindSafe(|| hook())) {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!(": {error}")),
+        Err(payload) => Some(
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| format!(": {message}"))
+                .or_else(|| {
+                    payload
+                        .downcast_ref::<String>()
+                        .map(|message| format!(": {message}"))
+                })
+                .unwrap_or_default(),
+        ),
+    }
+}
+
 fn run_query_callback(query: &Arc<QueryFn>, sql: &str) -> Result<String> {
     match catch_unwind(AssertUnwindSafe(|| query(sql))) {
         Ok(result) => result,
@@ -1179,19 +1385,32 @@ fn auth_ok(config: &HttpQueryServerConfig, request: &HttpRequest) -> bool {
 }
 
 /// Build the `GET /` landing page, matching the C++ reference: the tool name is
-/// uppercased and followed by the endpoint listing and a curl example.
-fn root_welcome(tool: &str, port: u16) -> String {
+/// uppercased and followed by the endpoint listing and a curl example. `/cancel`
+/// is listed (with its own curl line) only when it can succeed, i.e. with a
+/// script executor; otherwise the route answers 409.
+fn root_welcome(tool: &str, port: u16, cancel_supported: bool) -> String {
     let display = tool.to_uppercase();
-    format!(
+    let mut welcome = format!(
         "{display} HTTP Server\n\nEndpoints:\n\
          \x20 GET  /help     - API documentation\n\
-         \x20 POST /query    - Execute SQL query\n\
-         \x20 GET  /status   - Health check\n\
-         \x20 POST /cancel   - Cancel the in-flight query\n\
+         \x20 POST /query    - Execute SQL query\n"
+    );
+    if cancel_supported {
+        welcome.push_str("  POST /cancel   - Cancel the in-flight query\n");
+    }
+    welcome.push_str(&format!(
+        "  GET  /status   - Health check\n\
          \x20 POST /shutdown - Stop server\n\n\
-         Example: curl -X POST http://localhost:{port}/query -d \
+         Example: curl -X POST http://localhost:{port}/query --data-binary \
          \"SELECT name FROM sqlite_master WHERE type='table' LIMIT 10\"\n"
-    )
+    ));
+    if cancel_supported {
+        // -d '' sends Content-Length: 0, so the bodyless POST is framed.
+        welcome.push_str(&format!(
+            "Cancel:  curl -X POST -d '' http://localhost:{port}/cancel\n"
+        ));
+    }
+    welcome
 }
 
 fn status_json(config: &HttpQueryServerConfig) -> Result<String> {

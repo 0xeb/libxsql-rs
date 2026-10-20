@@ -18,7 +18,10 @@
 //!   - [`table`] — direct row-by-index access for simple in-memory data.
 //!   - [`cached_table`] — cache-backed rows with projection-aware population,
 //!     equality/prefix filters, hash indexes, rowid lookup, and an optional
-//!     shared cache.
+//!     shared cache. A SQL function that mutates the engine behind the tables
+//!     calls [`FunctionContext::invalidate_cached_tables`] (or
+//!     [`Database::invalidate_cached_tables`] from outside SQL) so later probes
+//!     rebuild.
 //!   - [`generator_table`] — streaming row sources with hidden columns,
 //!     required/optional constraints, and sort elision.
 //! - Scalar and aggregate SQL functions (including the built-in `blob_concat`).
@@ -30,7 +33,11 @@
 //! # Feature flags
 //!
 //! - `bundled-sqlite` — build SQLite through `libsqlite3-sys` (no system SQLite).
-//! - `thinclient` — the blocking HTTP query server and client ([`thinclient`]).
+//! - `thinclient` — the blocking HTTP query server and client (the `thinclient`
+//!   module). Enables `gzip`.
+//! - `gzip` — gzip response compression for the thinclient servers (the
+//!   pure-Rust `flate2` backend): a response is compressed when the client sends
+//!   `Accept-Encoding: gzip` and its media type is compressible.
 //! - `serde` — JSON formatting helpers for script results.
 //!
 //! # Quickstart
@@ -101,7 +108,9 @@ pub type OrderedJson = serde_json::Value;
 
 pub use aggregate::AggregateContext;
 pub use capabilities::{SqlCapability, define_sql_capabilities};
-pub use database::{Database, QueryOptions, QueryOutcome, QueryResult, Row, ScriptExecutionMode};
+pub use database::{
+    Database, FunctionFlags, QueryOptions, QueryOutcome, QueryResult, Row, ScriptExecutionMode,
+};
 pub use error::{
     Error, Result, Status, is_done, is_ok, is_ok_sqlite, is_ok_status, is_row, to_sqlite_status,
     to_status,
@@ -123,9 +132,9 @@ pub use table_printer::{TablePrintOptions, TableStyle, print_table};
 pub use value::{OwnedValue, ValueRef, ValueType};
 pub use vtab::{
     CachedTableBuilder, CachedTableDef, ColumnType, ConstraintOp, ConstraintRequest, Generator,
-    GeneratorConstraintArg, GeneratorTableBuilder, GeneratorTableDef, RowIterator, TableBuilder,
-    TableDef, TransactionHooks, TransactionState, cached_table, clear_vtab_interrupt_checker,
-    generator_table, optional_eq, optional_ge, optional_gt, optional_le, optional_like,
-    optional_lt, required_eq, required_like, set_vtab_error, set_vtab_interrupt_checker, table,
-    vtab_interrupted,
+    GeneratorConstraintArg, GeneratorTableBuilder, GeneratorTableDef, I64KeyRange, RowIterator,
+    TableBuilder, TableDef, TransactionHooks, TransactionState, U64Span, cached_table,
+    clear_vtab_interrupt_checker, exact_i64, exact_text, generator_table, optional_eq, optional_ge,
+    optional_gt, optional_le, optional_like, optional_lt, required_eq, required_gt, required_le,
+    required_like, set_vtab_error, set_vtab_interrupt_checker, table, vtab_interrupted,
 };
